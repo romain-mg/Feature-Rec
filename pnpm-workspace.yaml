@@ -1,11 +1,6 @@
 packages:
   - "packages/*"
-# apps/web is intentionally NOT a workspace member: it is "the product" whose
-# source code the pipeline reads as text (diff + tokens). It is not installed or
-# built by the AutoDemo monorepo. Run it standalone with `cd apps/web && pnpm i`.
 
 pnpm:
-  minimumReleaseAge: 0
-
-onlyBuiltDependencies:
-  - esbuild
+  onlyBuiltDependencies:
+    - esbuild
