@@ -1,0 +1,25 @@
+name: Feature-Rec
+description: Render frontend-visible PR changes and send them to Slack for validation.
+inputs:
+  config:
+    description: Path to .github/feature-rec-config.yaml in the checked-out repository.
+    required: false
+    default: .github/feature-rec-config.yaml
+  api-url:
+    description: Public URL for the Feature-Rec backend.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Run Feature-Rec
+      shell: bash
+      run: |
+        set -euo pipefail
+        corepack enable
+        ACTION_REPO_ROOT="$(cd "$GITHUB_ACTION_PATH/../.." && pwd)"
+        pnpm --dir "$ACTION_REPO_ROOT" install --frozen-lockfile
+        pnpm --dir "$ACTION_REPO_ROOT" --filter @feature-rec/action run start -- \
+          --repo "$GITHUB_WORKSPACE" \
+          --config "$GITHUB_WORKSPACE/${{ inputs.config }}" \
+          --api-url "${{ inputs.api-url }}" \
+          --event "$GITHUB_EVENT_PATH"
