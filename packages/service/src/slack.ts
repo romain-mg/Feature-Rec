@@ -159,7 +159,29 @@ export class SlackClient {
     });
   }
 
-  async openRequestChangesModal(): Promise<void> {
-    throw new Error("Request changes modal handling is added in the follow-up Slack interactivity commit.");
+  async openRequestChangesModal(triggerId: string, cycle: CycleRecord): Promise<void> {
+    await slackApi(this.#env, "views.open", {
+      trigger_id: triggerId,
+      view: {
+        type: "modal",
+        callback_id: "feature_rec_request_changes_modal",
+        private_metadata: JSON.stringify({ cycleId: cycle.id, headSha: cycle.headSha }),
+        title: { type: "plain_text", text: "Request changes" },
+        submit: { type: "plain_text", text: "Submit" },
+        close: { type: "plain_text", text: "Cancel" },
+        blocks: [
+          {
+            type: "input",
+            block_id: "comment",
+            label: { type: "plain_text", text: "Required comment" },
+            element: {
+              type: "plain_text_input",
+              action_id: "value",
+              multiline: true,
+            },
+          },
+        ],
+      },
+    });
   }
 }
