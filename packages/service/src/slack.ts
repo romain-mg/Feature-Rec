@@ -79,14 +79,14 @@ function validationBlocks(config: FeatureRecConfig, cycle: CycleRecord): unknown
       elements: [
         {
           type: "button",
-          text: { type: "plain_text", text: "All good, merge" },
+          text: { type: "plain_text", text: "Good to merge" },
           style: "primary",
           action_id: "feature_rec_accept",
           value: actionValue({ action: "accept", cycleId: cycle.id, headSha: cycle.headSha }),
         },
         {
           type: "button",
-          text: { type: "plain_text", text: "Request changes" },
+          text: { type: "plain_text", text: "Needs changes" },
           style: "danger",
           action_id: "feature_rec_request_changes",
           value: actionValue({
@@ -191,7 +191,7 @@ export class SlackClient {
         type: "modal",
         callback_id: "feature_rec_request_changes_modal",
         private_metadata: JSON.stringify({ cycleId: cycle.id, headSha: cycle.headSha }),
-        title: { type: "plain_text", text: "Request changes" },
+        title: { type: "plain_text", text: "Needs changes" },
         submit: { type: "plain_text", text: "Submit" },
         close: { type: "plain_text", text: "Cancel" },
         blocks: [

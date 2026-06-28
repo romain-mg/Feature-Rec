@@ -6,7 +6,7 @@ When a PR is opened or updated in **ready for review**, Feature-Rec checks wheth
 a frontend-visible change. Backend-only, docs-only, test-only, dependency-only, and CI-only changes
 are accepted automatically. If the change affects product UX, Feature-Rec generates a Remotion MP4
 of the change, posts it to Slack, tags the configured product group, and keeps the `Feature-Rec`
-Check Run pending until a business reviewer approves or requests changes.
+Check Run pending until a business reviewer approves or marks changes as needed.
 
 The video generation layer is **AutoDemo**: it reads changed UI code, reproduces the interface as
 Remotion components, and renders a clean screen-recording-style MP4 without launching the app.
@@ -45,13 +45,13 @@ Install Feature-Rec on a repository and every ready PR gets a product-aware gate
 | --- | --- | --- |
 | No frontend-visible product change | LLM classifier accepts the PR without bothering product. | `accepted` / success |
 | Frontend-visible product change | AutoDemo renders an MP4, the bot posts it to Slack, and configured reviewers choose what happens. | `pending` / in progress |
-| Product clicks **All good, merge** | Feature-Rec accepts the Check Run and posts the configured merge-ready comment to the PR author. | `accepted` / success |
-| Product clicks **Request changes** | Slack requires a comment, then Feature-Rec posts it to GitHub as the configured `{mention} make the following changes: ...` PR Conversation comment. | `rejected` / action required |
+| Product clicks **Good to merge** | Feature-Rec accepts the Check Run and posts the configured merge-ready comment to the PR author. | `accepted` / success |
+| Product clicks **Needs changes** | Slack requires a comment, then Feature-Rec posts it to GitHub as the configured `{mention} make the following changes: ...` PR Conversation comment. | `rejected` / action required |
 
 The Slack message has exactly the two decisions product needs:
 
-- **All good, merge**
-- **Request changes**
+- **Good to merge**
+- **Needs changes**
 
 When changes are requested, Claude can iterate on the PR, push a follow-up commit, and the next
 `synchronize` event starts the same loop again.
@@ -92,7 +92,7 @@ Feature-Rec is designed for the gap between code review and product validation:
    renders a Remotion video of the UI change.
 6. The backend uploads the video to the configured Slack channel and tags the configured group from
    `.github/feature-rec-config.yaml`.
-7. A product reviewer clicks **All good, merge** or **Request changes**.
+7. A product reviewer clicks **Good to merge** or **Needs changes**.
 8. Approval posts the configured PR Conversation comment and accepts the Check Run.
 9. Rejection requires a Slack comment, forwards that comment to GitHub as
    the configured `{mention} make the following changes: ...` PR Conversation comment, and marks
@@ -147,7 +147,7 @@ The agent inlines the hex/px values extracted from the code.)
                                               │
                  ┌────────────────────────────┴────────────────────────────┐
                  ▼                                                         ▼
-          All good, merge                                      Request changes + comment
+          Good to merge                                      Needs changes + comment
                  │                                                         │
                  ▼                                                         ▼
           accept Check Run                         GitHub comment + action required Check Run
