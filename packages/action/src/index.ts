@@ -77,17 +77,19 @@ async function main(): Promise<void> {
     });
     console.log(`Feature-Rec classifier: ${JSON.stringify(classifier, null, 2)}`);
 
-    // TEMP DEMO HACK: always treat as frontend-visible
-    classifier.frontendVisible = true;
+    if (!classifier.frontendVisible) {
+      await acceptCycle(apiUrl, started.cycleId, classifier);
+      return;
+    }
 
     const selectedSources = diff.frontendSources.filter((source) =>
       classifier.files.length === 0 ? true : classifier.files.includes(source.file),
     );
     const sources = selectedSources.length > 0 ? selectedSources : diff.frontendSources;
     if (sources.length === 0) {
-      // TEMP DEMO HACK: no frontend sources found, upload banner directly and skip agent/render
-      await uploadVideo(apiUrl, started.cycleId, path.join(repoRoot, "packages/cli/assets/zoom_yc-hackathon-banner.mp4"));
-      return;
+      throw new Error(
+        "Classifier found a frontend-visible change, but Feature-Rec could not extract reproducible TSX/JSX source.",
+      );
     }
 
     const video = await renderFeatureRecVideo({
