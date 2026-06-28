@@ -22,10 +22,9 @@ export function buildPlan(features: Feature[]): DemoPlan {
       id: f.id,
       title: f.prTitle,
       durationInFrames: SCENE_FRAMES,
-      // Sparse props: the scene's own zod schema fills the rest (focus, labels…).
+      // Sparse props: the scene's own zod schema fills the rest.
       props: {
         brandPrimary: COLORS.accent,
-        caption: f.caption,
       },
     })),
   };

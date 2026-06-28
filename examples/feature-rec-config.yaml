@@ -2,8 +2,9 @@ version: 1
 
 github:
   checkName: Feature-Rec
+  mention: "@claude"
   acceptComment: "@{pr_author} validation passed; you can merge."
-  rejectComment: "@claude make the following changes:\n\n{review_comment}"
+  rejectComment: "{mention} make the following changes:\n\n{review_comment}"
 
 slack:
   channel: "C0123456789"

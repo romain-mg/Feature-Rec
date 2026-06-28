@@ -7,11 +7,12 @@ export const FeatureRecConfigSchema = z.object({
   version: z.literal(1),
   github: z.object({
     checkName: z.string().min(1).default("Feature-Rec"),
+    mention: z.string().default("@claude"),
     acceptComment: z.string().min(1).default("@{pr_author} validation passed; you can merge."),
     rejectComment: z
       .string()
       .min(1)
-      .default("@claude make the following changes:\n\n{review_comment}"),
+      .default("{mention} make the following changes:\n\n{review_comment}"),
   }),
   slack: z.object({
     channel: z.string().min(1),

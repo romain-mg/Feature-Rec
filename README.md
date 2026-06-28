@@ -9,8 +9,7 @@ of the change, posts it to Slack, tags the configured product group, and keeps t
 Check Run pending until a business reviewer approves or requests changes.
 
 The video generation layer is **AutoDemo**: it reads changed UI code, reproduces the interface as
-Remotion components, animates the new element, and renders a polished MP4 without screen-recording
-the app.
+Remotion components, and renders a clean screen-recording-style MP4 without launching the app.
 
 <sub>Hackathon MVP · GitHub Actions · Slack · Remotion · Claude · pnpm monorepo</sub>
 
@@ -28,7 +27,7 @@ the app.
 - [Project structure](#project-structure)
 - [Core concepts](#core-concepts)
 - [The UI Replication Agent](#the-ui-replication-agent)
-- [The cinematic layer & design system](#the-cinematic-layer--design-system)
+- [Screen-style rendering & design system](#screen-style-rendering--design-system)
 - [Configuration](#configuration)
 - [Extending: add your own feature](#extending-add-your-own-feature)
 - [Hard constraints](#hard-constraints)
@@ -47,7 +46,7 @@ Install Feature-Rec on a repository and every ready PR gets a product-aware gate
 | No frontend-visible product change | LLM classifier accepts the PR without bothering product. | `accepted` / success |
 | Frontend-visible product change | AutoDemo renders an MP4, the bot posts it to Slack, and configured reviewers choose what happens. | `pending` / in progress |
 | Product clicks **All good, merge** | Feature-Rec accepts the Check Run and posts the configured merge-ready comment to the PR author. | `accepted` / success |
-| Product clicks **Request changes** | Slack requires a comment, then Feature-Rec posts it to GitHub as the configured `@claude make the following changes: ...` comment. | `rejected` / action required |
+| Product clicks **Request changes** | Slack requires a comment, then Feature-Rec posts it to GitHub as the configured `{mention} make the following changes: ...` PR Conversation comment. | `rejected` / action required |
 
 The Slack message has exactly the two decisions product needs:
 
@@ -65,11 +64,10 @@ pnpm demo
 
 That produces **`out/demo.mp4`** — a 1920×1080 · 30fps · **no-audio** video that shows:
 
-1. a **branded intro** (product name, release tag, PR number),
-2. the **changed UI reproduced 1:1** from the source code (real React/Remotion, not a screenshot),
-3. the **new element animated** (e.g. a toggle sliding on, a button popping in),
-4. a **camera zoom + spotlight + caption** highlighting exactly what changed,
-5. a **branded outro**.
+1. the **changed UI reproduced 1:1** from the source code (real React/Remotion, not a screenshot),
+2. the **before state** held briefly,
+3. the **minimal interaction or transition** that reveals the change,
+4. the **after state** held for review.
 
 Plus `out/CHANGELOG.md` and `out/pr-comment.md` ready to publish.
 
@@ -95,9 +93,10 @@ Feature-Rec is designed for the gap between code review and product validation:
 6. The backend uploads the video to the configured Slack channel and tags the configured group from
    `.github/feature-rec-config.yaml`.
 7. A product reviewer clicks **All good, merge** or **Request changes**.
-8. Approval accepts the Check Run and comments that the developer can merge.
+8. Approval posts the configured PR Conversation comment and accepts the Check Run.
 9. Rejection requires a Slack comment, forwards that comment to GitHub as
-   `@claude make the following changes: ...`, and marks the Check Run as action required.
+   the configured `{mention} make the following changes: ...` PR Conversation comment, and marks
+   the Check Run as action required.
 
 This keeps product validation inside the merge gate without asking product to read diffs or pull a
 branch locally.
@@ -172,8 +171,9 @@ version: 1
 
 github:
   checkName: Feature-Rec
+  mention: "@claude"
   acceptComment: "@{pr_author} validation passed; you can merge."
-  rejectComment: "@claude make the following changes:\n\n{review_comment}"
+  rejectComment: "{mention} make the following changes:\n\n{review_comment}"
 
 slack:
   channel: "C0123456789"
@@ -198,8 +198,8 @@ change. Its standalone pipeline is:
  read diff +    Claude         DemoPlan +     Remotion
  design tokens  reproduces     scene          bundle +
                 UI 1:1 &       registry       renderMedia
-                animates                         │
-                the hero                         ▼
+                shows the                        │
+                change                           ▼
                                              out/demo.mp4
 ```
 
@@ -211,7 +211,7 @@ Each video stage is a module in `packages/cli/src/`:
    live `git diff` range (`--git HEAD~1`).
 2. **`agent`** (`agent/`) — the **UI Replication Agent**. Sends Claude the 5-section prompt with the
    before/after code + tokens; Claude returns one Remotion scene that reproduces the changed markup
-   with its **exact classNames** and animates only the **hero** (the added/changed element). The
+   with its **exact classNames** and shows the smallest before-to-after interaction. The
    output is validated; if there's no API key or it fails, a **known-good** scene is used so a scene
    is never empty. → [details](#the-ui-replication-agent)
 3. **`compose`** (`compose.ts` + `scenes.ts`) — writes the scene to
@@ -223,8 +223,8 @@ Each video stage is a module in `packages/cli/src/`:
 5. **`publish`** (`publish.ts`) — prepends `out/CHANGELOG.md` and writes `out/pr-comment.md`
    (`--post` posts it via the `gh` CLI).
 
-The composition (`ReleaseDemo.tsx`) is a `<Series>`: **Intro** (75 frames) → **scene(s)** (175
-frames each by default) → **Outro** (60 frames). The registry holds the (non-serializable)
+The composition (`ReleaseDemo.tsx`) is a `<Series>` of generated scenes only. There is no branded
+intro, outro, spotlight, caption, or cinematic zoom. The registry holds the (non-serializable)
 components; the DemoPlan holds only ids + props, so it can be passed to Remotion as `inputProps`.
 
 ---
@@ -365,10 +365,10 @@ agora/
 │  │     ├─ index.ts                  #   registerRoot + imports index.css
 │  │     ├─ Root.tsx                  #   the <Composition> (1920×1080@30fps)
 │  │     ├─ schema.ts                 #   DemoPlan / Brand / SceneRef zod schemas + totalFrames()
-│  │     ├─ tokens.ts                 #   design system (colors, motion presets, frame counts)
+│  │     ├─ tokens.ts                 #   design system (colors + motion presets)
 │  │     ├─ font.ts                   #   Inter via @remotion/google-fonts
-│  │     ├─ components/               #   Intro, Outro, Camera, Spotlight, Caption
-│  │     ├─ compositions/             #   ReleaseDemo (assembles everything), MissingScene
+│  │     ├─ components/               #   screen helpers + legacy chrome components
+│  │     ├─ compositions/             #   ReleaseDemo (scene timeline), MissingScene
 │  │     └─ scenes/
 │  │        ├─ index.ts               #   the registry (AUTO-GENERATED)
 │  │        └─ generated/             #   scenes land here (agent output / known-good)
@@ -410,10 +410,9 @@ agora/
 | --- | --- |
 | **DemoPlan** | The serializable spine of a video: `{ brand, scenes[] }`. Built by the CLI, passed to Remotion as `inputProps`. JSON-only (no components/functions). |
 | **Scene** | One generated Remotion component reproducing a change. Exports a default component + a named zod `schema`. |
-| **Hero** | The new/changed element (the toggle, the button…). The **only** thing animated; the rest of the UI is static context. |
+| **Hero** | The new/changed element (the toggle, the button…). The clip starts from the before state, shows the minimal interaction/change, then holds the after state. |
 | **Registry** | `scenes/index.ts` — maps `scene id → { Component, schema }`. Auto-regenerated so the bundle picks up new scenes. |
-| **Camera / Spotlight / Caption** | The cinematic chrome: zoom toward the hero, a scrim with a radial hole, and a labeling pill. |
-| **`focus`** | `{ x, y, scale }` in **composition pixels** (1920×1080). Because the agent lays out the hero, it knows its center → the zoom is just `scale` + `transformOrigin`. |
+| **ScreenFrame / Cursor** | Neutral helpers for making partial components look like a clean screen recording without adding presentation copy. |
 
 ---
 
@@ -440,38 +439,31 @@ Lives in `packages/cli/src/agent/`. For each feature:
 **Integration contract** (what a generated scene may rely on):
 
 - Saved to `packages/video/src/scenes/generated/<id>.tsx`; frames are **scene-relative**.
-- May import: `{ Camera, Spotlight, Caption }` from `../../components`,
-  `{ COLORS, RADIAL_BG, SPRING_SMOOTH, SPRING_POP }` from `../../tokens`,
+- May import: `{ ScreenFrame, Cursor }` from `../../components`,
+  `{ SPRING_SMOOTH, SPRING_POP }` from `../../tokens`,
   `{ fontFamily }` from `../../font`, plus `remotion` and `zod`.
-- Root `<AbsoluteFill>` uses `style={{ background: RADIAL_BG, fontFamily }}`.
+- Root scene should look like a clean app screen or neutral app/window viewport.
 - `export default function Scene(props: Partial<z.infer<typeof schema>>)`, starting with
   `const { ... } = schema.parse(props ?? {})`.
 
 ---
 
-## The cinematic layer & design system
+## Screen-style rendering & design system
 
-**Design tokens** (`tokens.ts`) — a "devtool premium dark" palette; the brand accent is the only
-vivid color. Base `#08080C`, glow `#14121F`, surface `#16161F`, accent `#6C5CE7`, text
-`#F5F5F7`/`#C7C7D2`/`#8A8A9A`. Typography: **Inter** (via `@remotion/google-fonts`), numbers in
-`tabular-nums`.
+Generated scenes should look like a simple screen recording of the changed UI. They can use
+`ScreenFrame` for a neutral viewport and `Cursor` for the minimal interaction, but should not add
+title cards, release labels, spotlights, captions, or cinematic zooms.
 
-> These tokens style the **brand chrome** (Intro/Outro/Camera/Spotlight/Caption). The **reproduced
-> UI** uses the target repo's own classNames/colors — fidelity comes from the source code, never
-> from here.
+The reproduced UI still uses the target repo's own classNames/colors — fidelity comes from the
+source code, never from AutoDemo's tokens.
 
 **Motion presets:**
-- `SPRING_SMOOTH` `{ damping:200, mass:0.6, stiffness:100 }` — entrances + camera zoom, zero bounce.
-- `SPRING_POP` `{ damping:13, mass:0.8, stiffness:200 }` — pills, buttons (snappy pop).
+- `SPRING_SMOOTH` `{ damping:200, mass:0.6, stiffness:100 }` — cursor moves, row expansion, zero bounce.
+- `SPRING_POP` `{ damping:13, mass:0.8, stiffness:200 }` — clicks, buttons, short UI reveals.
 - Fades: `interpolate` + `Easing.out(Easing.cubic)`, clamped.
 
-**Camera / Spotlight / Caption:**
-- `<Camera>` scales the whole stage with `transform: scale()` + `transformOrigin: "${x}px ${y}px"`.
-- `<Spotlight>` is a screen-space scrim with a `radial-gradient` mask hole over the hero while zoomed.
-- `<Caption>` is an accent pill that pops in (`SPRING_POP`) near the hero.
-
-**Typical choreography** (scene-relative frames): `[0–14]` stage + context fade/scale in →
-`[14–30]` hero reveal → `[40…]` camera zoom + spotlight (hold, ease back) → `~54` caption pops.
+**Typical choreography** (scene-relative frames): `[0-24]` before state →
+`[24-70]` minimal interaction/change → `[70-end]` after state hold.
 
 ---
 
@@ -534,8 +526,8 @@ To QA a render frame-by-frame, edit the frame list in `packages/cli/src/stills.t
 
 These are enforced by design and by validation:
 
-- **No audio.** No TTS, no narration, no `<Audio>`. Captions on-screen carry the explanation; the
-  render is `muted` (no audio track at all).
+- **No audio.** No TTS, no narration, no `<Audio>`. The render is `muted` (no audio track at all).
+- **No presentation chrome.** No intro, outro, spotlight, caption pill, or cinematic zoom.
 - **Reproduce from code, never capture.** The UI is re-rendered in React/Remotion (no Playwright).
 - **No network** inside generated scenes.
 - **Local render only** (no Lambda in the MVP).

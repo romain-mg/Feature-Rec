@@ -34,6 +34,13 @@ const FORBIDDEN: Array<{ re: RegExp; why: string }> = [
   { re: /XMLHttpRequest/, why: "network calls are forbidden (XMLHttpRequest)" },
   { re: /\bnew\s+WebSocket/, why: "network calls are forbidden (WebSocket)" },
   { re: /import\s+[^;]*https?:\/\//, why: "remote imports are forbidden" },
+  {
+    re: /import\s+\{[^}]*\b(Camera|Spotlight|Caption|Intro|Outro)\b[^}]*\}\s+from\s+["']\.\.\/\.\.\/components["']/,
+    why: "presentation chrome helpers are forbidden",
+  },
+  { re: /from\s+["']\.\.\/\.\.\/components\/(Camera|Spotlight|Caption|Intro|Outro)["']/, why: "presentation chrome helpers are forbidden" },
+  { re: /<\s*(Camera|Spotlight|Caption|Intro|Outro)\b/, why: "presentation chrome elements are forbidden" },
+  { re: /\bRADIAL_BG\b/, why: "presentation background chrome is forbidden" },
 ];
 
 /**

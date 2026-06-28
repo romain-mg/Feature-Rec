@@ -1,6 +1,6 @@
 import React from "react";
 import { AbsoluteFill } from "remotion";
-import { COLORS, RADIAL_BG } from "../tokens";
+import { COLORS } from "../tokens";
 import { fontFamily } from "../font";
 
 /**
@@ -11,7 +11,7 @@ export const MissingScene: React.FC<{ id: string }> = ({ id }) => {
   return (
     <AbsoluteFill
       style={{
-        background: RADIAL_BG,
+        background: "#F6F7FB",
         fontFamily,
         alignItems: "center",
         justifyContent: "center",
@@ -21,9 +21,10 @@ export const MissingScene: React.FC<{ id: string }> = ({ id }) => {
       <div
         style={{
           padding: "28px 40px",
-          borderRadius: 20,
-          background: COLORS.surface,
-          border: `1px solid ${COLORS.hairline}`,
+          borderRadius: 14,
+          background: "#FFFFFF",
+          border: "1px solid rgba(15, 23, 42, 0.10)",
+          boxShadow: "0 24px 80px rgba(15, 23, 42, 0.12)",
           fontSize: 30,
           fontWeight: 600,
         }}

@@ -103,5 +103,14 @@ ok(
   ),
 );
 
+ok(
+  "validateScene rejects presentation chrome",
+  throws(() =>
+    validateScene(
+      'import { Spotlight } from "../../components"; export default function X(){return <Spotlight x={1} y={2} radius={3} opacity={1} />} export const schema = z.object({a: z.string().default("")});',
+    ),
+  ),
+);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

@@ -1,8 +1,9 @@
 import type { Feature, ProjectTokens } from "../analyze";
 
 export const SYSTEM_PROMPT = `You are the AutoDemo UI Replication Agent.
-You convert a UI code change into an animated Remotion scene that REPRODUCES the
-changed interface 1:1 and animates the NEW/CHANGED element. Reproduce — do not redesign.
+You convert a UI code change into a screen-recording-style Remotion scene that
+REPRODUCES the changed interface 1:1 and shows the NEW/CHANGED behavior.
+Reproduce — do not redesign.
 
 Hard rules (never violate):
 - Reproduce, don't invent. Reuse the source component's EXACT Tailwind classNames
@@ -10,6 +11,8 @@ Hard rules (never violate):
   typography come from the code, never made up.
 - NO audio. Never emit <Audio>, useAudioData, or any sound.
 - NO network. No fetch/XMLHttpRequest/import of remote assets. Inline SVGs only.
+- NO presentation chrome. No title cards, release labels, spotlights, captions,
+  cinematic zooms, or explanatory text outside the reproduced UI.
 - Frames are SCENE-RELATIVE (the scene is wrapped in a Series.Sequence).
 - Output format is strict (see OUTPUT). Return ONLY the 5 sections.`;
 
@@ -23,27 +26,23 @@ const INTEGRATION_CONTRACT = `INTEGRATION CONTRACT (the file is saved to package
   Every schema field MUST have a .default() so partial props still render.
 - The component signature is \`export default function Scene(props: Partial<z.infer<typeof schema>>)\`;
   start with \`const { ... } = schema.parse(props ?? {})\`.
-- You MAY import these stable helpers (use them — don't re-implement):
-    import { Camera, Spotlight, Caption } from "../../components";
-    import { COLORS, RADIAL_BG, SPRING_SMOOTH, SPRING_POP } from "../../tokens";
+- You MAY import these stable helpers:
+    import { ScreenFrame, Cursor } from "../../components";
+    import { SPRING_SMOOTH, SPRING_POP } from "../../tokens";
     import { fontFamily } from "../../font";
   plus anything from "remotion" and "zod".
-- Set \`style={{ background: RADIAL_BG, fontFamily }}\` on the root AbsoluteFill so the
-  reproduced UI inherits the Inter font and sits on the dark stage.
-- <Camera scale originX originY opacity> scales the stage toward a focus point given in
-  COMPOSITION px. You place the hero, so you KNOW its center — set focus.x/focus.y to it.
-- <Spotlight x y radius opacity> is a screen-space scrim with a radial hole over the hero.
-- <Caption text x y startFrame accent> is a screen-space pill labelling the change.
-- The hero (the added/changed element) is the ONLY thing animated. Surrounding UI is
-  static context, reproduced faithfully.`;
+- Set \`fontFamily\` on the root or app frame so text renders consistently.
+- If the changed component is partial, put it inside a minimal neutral app/window viewport.
+  The wrapper exists only to make the UI readable; do not add marketing copy or release context.
+- Start from the BEFORE state, perform the minimal visible interaction or transition that reveals
+  the change, then hold the AFTER state. Surrounding UI remains static context.`;
 
-const CHOREOGRAPHY = `ANIMATION (scene-relative frames, target 150-180 total)
-  [0-14]   stage + context UI fade/scale in (interpolate + Easing.out(cubic), clamp).
-  [14-30]  hero reveal: spring SPRING_SMOOTH (toggle slides on / button pops / row expands).
-  [40-..]  CAMERA ZOOM onto the hero via <Camera> using SPRING_SMOOTH toward focus.x/y;
-           hold, then ease back near the end. Drive <Spotlight> opacity/radius by the same
-           zoom progress (0..1).
-  [~54]    <Caption> pops in (SPRING_POP) near the hero.`;
+const CHOREOGRAPHY = `ANIMATION (scene-relative frames, target 120-180 total)
+  [0-24]   show the BEFORE state as if the screen recording has just started.
+  [24-70]  perform one minimal interaction or transition for the changed element
+           (cursor move/click, toggle slide, button appear, row expand, text typing, etc.).
+  [70-end] hold the AFTER state long enough for review.
+No camera zooms, no spotlights, no captions, no intro/outro.`;
 
 export function buildUserPrompt(feature: Feature, tokens: ProjectTokens): string {
   return `INPUT
@@ -81,10 +80,10 @@ Produce the following 5 sections. Sections 1-4 are concise bullets. Section 5 is
 1. VISUAL SPECS — extracted FROM THE CODE (never invented): exact colors (hex/rgb), typography
    (family/weight/size resolved from Tailwind), layout structure, and the position of the changed
    element within it. Inline any SVG/icons present in the diff.
-2. VIDEO CONFIGURATION — 1920x1080 @ 30fps; duration in frames for THIS scene (150-180); the
-   reproduced UI centered on the dark stage (it is live components, not a screenshot).
+2. VIDEO CONFIGURATION — 1920x1080 @ 30fps; duration in frames for THIS scene (120-180); the
+   reproduced UI should look like a clean screen recording of the app, not a presentation.
 3. DATA & PROPS (zod) — the schema with .default() on every field: brandPrimary, any text/number
-   that could vary, and focus { x, y, scale }.
+   that could vary, and cursor/interaction coordinates if needed.
 4. ANIMATION LOGIC — diff BEFORE vs AFTER to find the HERO; give exact frame ranges and which
    spring/interpolate drives each part.
 5. OUTPUT — ONE self-contained Remotion React functional component, reproducing the changed

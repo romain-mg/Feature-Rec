@@ -8,7 +8,7 @@ Feature-Rec turns frontend-visible PR changes into a Slack validation flow:
 4. If a frontend-visible change is found, the action reuses AutoDemo to render a Remotion MP4.
 5. The local Feature-Rec backend uploads the video to Slack and posts validation buttons.
 6. `All good, merge` accepts the Check Run.
-7. `Request changes` opens a required Slack modal, then posts the comment to GitHub as `@claude make the following changes: ...` and rejects the Check Run.
+7. `Request changes` opens a required Slack modal, then posts the configured PR Conversation comment, including `github.mention`, and rejects the Check Run.
 
 For this hackathon run, Feature-Rec intentionally ignores backend-only product changes. If the classifier says a change is frontend-visible but the action cannot extract TSX/JSX source to reproduce, the Check Run fails clearly instead of sending a non-UI summary video.
 

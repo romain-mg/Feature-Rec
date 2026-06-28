@@ -7,7 +7,7 @@ import { enableTailwind } from "@remotion/tailwind-v4";
 import { readPlan } from "./compose";
 import { OUT_DIR, VIDEO_ENTRY } from "./paths";
 
-const FRAMES = [110, 270, 320, 470];
+const FRAMES = [0, 40, 90, 140];
 
 async function main() {
   const plan = readPlan();

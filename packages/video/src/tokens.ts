@@ -1,6 +1,6 @@
 /**
  * AutoDemo design system — "devtool premium dark".
- * These tokens style the brand chrome (Intro / Outro / Stage / Camera / Spotlight).
+ * These tokens support shared motion and legacy chrome components.
  * The REPRODUCED UI inside a scene uses the target repo's own classNames/colors,
  * never these — fidelity comes from the source code, not from here.
  */
@@ -19,7 +19,7 @@ export const COLORS = {
   hairline: "rgba(255,255,255,0.08)",
 } as const;
 
-/** Entrances + camera zoom — critically damped, zero bounce. */
+/** Smooth UI transitions — critically damped, zero bounce. */
 export const SPRING_SMOOTH = { damping: 200, mass: 0.6, stiffness: 100 } as const;
 /** Pills / captions — snappy pop. */
 export const SPRING_POP = { damping: 13, mass: 0.8, stiffness: 200 } as const;

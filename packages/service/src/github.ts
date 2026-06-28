@@ -11,6 +11,10 @@ type CheckOutput = {
   summary: string;
 };
 
+type IssueComment = {
+  html_url: string;
+};
+
 function b64url(input: string | Buffer): string {
   return Buffer.from(input)
     .toString("base64")
@@ -135,45 +139,51 @@ export class GitHubClient {
     });
   }
 
-  async comment(cycle: CycleRecord, body: string): Promise<void> {
+  async comment(cycle: CycleRecord, body: string): Promise<string> {
     const token = await this.tokenForRepo(cycle.owner, cycle.repo);
-    await githubFetch(`/repos/${cycle.owner}/${cycle.repo}/issues/${cycle.prNumber}/comments`, {
-      token,
-      method: "POST",
-      body: { body },
-    });
+    const comment = await githubFetch<IssueComment>(
+      `/repos/${cycle.owner}/${cycle.repo}/issues/${cycle.prNumber}/comments`,
+      {
+        token,
+        method: "POST",
+        body: { body },
+      },
+    );
+    return comment.html_url;
   }
 
   async accept(cycle: CycleRecord, template: string): Promise<void> {
+    const commentUrl = await this.comment(
+      cycle,
+      renderTemplate(template, {
+        mention: cycle.config.github.mention,
+        pr_author: cycle.prAuthor,
+      }).trim(),
+    );
     await this.updateCheckRun(cycle, {
       conclusion: "success",
       output: {
         title: "Feature-Rec: accepted",
-        summary: "Validation passed.",
+        summary: `Validation passed. See PR conversation: ${commentUrl}`,
       },
     });
-    await this.comment(
-      cycle,
-      renderTemplate(template, {
-        pr_author: cycle.prAuthor,
-      }).trim(),
-    );
   }
 
   async reject(cycle: CycleRecord, template: string, reviewComment: string): Promise<void> {
-    await this.updateCheckRun(cycle, {
-      conclusion: "action_required",
-      output: {
-        title: "Feature-Rec: rejected",
-        summary: `Validation requested changes.\n\n${reviewComment}`,
-      },
-    });
-    await this.comment(
+    const commentUrl = await this.comment(
       cycle,
       renderTemplate(template, {
+        mention: cycle.config.github.mention,
         review_comment: reviewComment,
         pr_author: cycle.prAuthor,
       }).trim(),
     );
+    await this.updateCheckRun(cycle, {
+      conclusion: "action_required",
+      output: {
+        title: "Feature-Rec: rejected",
+        summary: `Validation requested changes. See PR conversation: ${commentUrl}`,
+      },
+    });
   }
 }

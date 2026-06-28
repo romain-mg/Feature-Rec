@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { INTRO_FRAMES, OUTRO_FRAMES, DEFAULT_ACCENT } from "./tokens";
+import { DEFAULT_ACCENT } from "./tokens";
 
 /**
  * DemoPlan — the serializable spine of a release video.
@@ -19,7 +19,7 @@ export type Brand = z.infer<typeof BrandSchema>;
 /**
  * A reference to one generated scene + the props it should render with.
  * `id` matches a key in the (generated) scene registry; `props` is that
- * scene's own zod-validated prop object (labels, values, focus, brandPrimary...).
+ * scene's own zod-validated prop object (values, cursor coordinates, brandPrimary...).
  */
 export const SceneRefSchema = z.object({
   id: z.string(),
@@ -35,8 +35,8 @@ export const DemoPlanSchema = z.object({
 });
 export type DemoPlan = z.infer<typeof DemoPlanSchema>;
 
-/** Total composition length = intro + every scene + outro. */
+/** Total composition length = every generated scene, with no presentation intro/outro. */
 export function totalFrames(plan: DemoPlan): number {
   const scenes = plan.scenes.reduce((acc, s) => acc + s.durationInFrames, 0);
-  return INTRO_FRAMES + scenes + OUTRO_FRAMES;
+  return Math.max(1, scenes);
 }

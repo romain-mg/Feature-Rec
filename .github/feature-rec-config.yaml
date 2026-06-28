@@ -1,7 +1,12 @@
-slack:
-  channel: "#featurerec-demo"
-  botToken: ""
+version: 1
 
 github:
-  approveComment: "✅ Approved by PM via FeatureRec — @dev you can merge"
-  rejectComment: "@claude make the following changes: "
+  checkName: Feature-Rec
+  mention: "@claude"
+  acceptComment: "✅ Approved by PM via FeatureRec — @{pr_author} you can merge"
+  rejectComment: "{mention} make the following changes:\n\n{review_comment}"
+
+slack:
+  channel: "#featurerec-demo"
+  mention: ""
+  approverUsergroups: []
