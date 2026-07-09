@@ -1,10 +1,11 @@
-#!/usr/bin/env -S node --experimental-sqlite
+#!/usr/bin/env node
 import { readEnv } from "./env";
 import { buildServer } from "./http";
-import { SqliteCycleStore } from "./storage/sqlite";
+import { PostgresCycleStore } from "./storage/postgres";
 
 const env = readEnv();
-const store = new SqliteCycleStore(env.dbPath);
+const store = new PostgresCycleStore(env.databaseUrl);
+await store.init();
 const server = buildServer({ env, store });
 
 const close = async () => {

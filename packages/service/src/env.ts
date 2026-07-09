@@ -1,9 +1,7 @@
-import path from "node:path";
-
 export type ServiceEnv = {
   port: number;
   baseUrl: string;
-  dbPath: string;
+  databaseUrl: string;
   runnerToken: string;
   githubToken: string;
   githubAppId: string;
@@ -13,10 +11,14 @@ export type ServiceEnv = {
 };
 
 export function readEnv(env = process.env): ServiceEnv {
+  const databaseUrl = env.DATABASE_URL;
+  if (!databaseUrl) {
+    throw new Error("DATABASE_URL is required");
+  }
   return {
     port: Number(env.PORT) || 3000,
     baseUrl: env.FEATURE_REC_BASE_URL ?? `http://localhost:${Number(env.PORT) || 3000}`,
-    dbPath: env.FEATURE_REC_DB_PATH ?? path.resolve(process.cwd(), "data/feature-rec.sqlite"),
+    databaseUrl,
     runnerToken: env.FEATURE_REC_RUNNER_TOKEN ?? "",
     githubToken: env.FEATURE_REC_GITHUB_TOKEN ?? env.GITHUB_TOKEN ?? "",
     githubAppId: env.GITHUB_APP_ID ?? "",
