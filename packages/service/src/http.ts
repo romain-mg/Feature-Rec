@@ -8,6 +8,7 @@ import {
 } from "@feature-rec/core";
 import type { ServiceEnv } from "./env";
 import { GitHubClient } from "./github";
+import { withRetry } from "./retry";
 import { SlackClient, verifySlackSignature } from "./slack";
 import type { CycleStore } from "./storage";
 
@@ -59,24 +60,6 @@ function classifierSummary(raw: unknown): string {
 function runnerAuthorized(env: ServiceEnv, header: unknown): boolean {
   if (!env.runnerToken || typeof header !== "string") return false;
   return timingSafeStringEqual(header, `Bearer ${env.runnerToken}`);
-}
-
-// The DB transition is the source of truth; GitHub/Slack side effects run after
-// it. Bounded retry narrows the window where a transient API failure leaves the
-// check run out of sync with a cycle the DB already settled.
-async function withRetry<T>(fn: () => Promise<T>, attempts = 3, delayMs = 200): Promise<T> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastError = err;
-      if (attempt < attempts - 1) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-      }
-    }
-  }
-  throw lastError;
 }
 
 function bodyAttemptId(body: unknown): string | undefined {
@@ -317,10 +300,14 @@ export function buildServer(input: {
       if (statusAfter === "superseded") {
         // Superseded after the transition but before the Slack post landed:
         // finalize the message we just posted so it can't strand in Slack.
-        await slack.finalize(
-          { ...cycle, slackChannelId: message.channel, slackMessageTs: message.ts },
-          "superseded",
-          "A newer commit started a fresh validation cycle.",
+        // Retried: nobody else will ever repair this message (the superseder's
+        // cleanup already ran and saw no coordinates), and chat.update is idempotent.
+        await withRetry(() =>
+          slack.finalize(
+            { ...cycle, slackChannelId: message.channel, slackMessageTs: message.ts },
+            "superseded",
+            "A newer commit started a fresh validation cycle.",
+          ),
         );
       }
       return { ok: true, channel: message.channel, ts: message.ts };
@@ -381,8 +368,10 @@ export function buildServer(input: {
         to: "accepted",
       });
       if (!accepted) return;
-      await withRetry(() => github.accept(accepted, accepted.config.github.acceptComment));
-      await slack.finalize(accepted, "accepted", "Validation passed.");
+      // No withRetry around accept: the comment POST inside is not idempotent;
+      // the check-run PATCH retries internally (see GitHubClient.accept).
+      await github.accept(accepted, accepted.config.github.acceptComment);
+      await withRetry(() => slack.finalize(accepted, "accepted", "Validation passed."));
       return;
     }
 
@@ -409,8 +398,10 @@ export function buildServer(input: {
       to: "rejected",
     });
     if (!rejected) return;
-    await withRetry(() => github.reject(rejected, rejected.config.github.rejectComment, comment.trim()));
-    await slack.finalize(rejected, "rejected", comment.trim());
+    // No withRetry around reject: comment POST is not idempotent; the check-run
+    // PATCH retries internally (see GitHubClient.reject).
+    await github.reject(rejected, rejected.config.github.rejectComment, comment.trim());
+    await withRetry(() => slack.finalize(rejected, "rejected", comment.trim()));
   }
 
   return app;

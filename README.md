@@ -166,9 +166,6 @@ pnpm feature-rec:selftest
 For detailed Feature-Rec setup, permissions, and smoke checks, read
 [`docs/feature-rec.md`](docs/feature-rec.md).
 
-For the system architecture, hosting plan, and Remotion replacement strategy,
-read [`docs/technical-architecture.md`](docs/technical-architecture.md).
-
 ## Roadmap
 
 Remotion will be replaced with an in-house solution we are currently building.

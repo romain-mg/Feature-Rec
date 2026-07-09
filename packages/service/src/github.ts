@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import type { RunStartRequest } from "@feature-rec/core";
 import { renderTemplate } from "@feature-rec/core";
 import type { ServiceEnv } from "./env";
+import { withRetry } from "./retry";
 import type { CycleRecord } from "./storage";
 
 type CheckConclusion = "success" | "failure" | "neutral" | "action_required";
@@ -152,6 +153,9 @@ export class GitHubClient {
     return comment.html_url;
   }
 
+  // Retry policy: the comment POST is single-shot (retrying after a post-write
+  // timeout would duplicate PR comments — not idempotent); the check-run PATCH
+  // is idempotent and retried. Callers must NOT wrap these methods in withRetry.
   async accept(cycle: CycleRecord, template: string): Promise<void> {
     const commentUrl = await this.comment(
       cycle,
@@ -160,13 +164,15 @@ export class GitHubClient {
         pr_author: cycle.prAuthor,
       }).trim(),
     );
-    await this.updateCheckRun(cycle, {
-      conclusion: "success",
-      output: {
-        title: "Feature-Rec: accepted",
-        summary: `Validation passed. See PR conversation: ${commentUrl}`,
-      },
-    });
+    await withRetry(() =>
+      this.updateCheckRun(cycle, {
+        conclusion: "success",
+        output: {
+          title: "Feature-Rec: accepted",
+          summary: `Validation passed. See PR conversation: ${commentUrl}`,
+        },
+      }),
+    );
   }
 
   async reject(cycle: CycleRecord, template: string, reviewComment: string): Promise<void> {
@@ -178,12 +184,14 @@ export class GitHubClient {
         pr_author: cycle.prAuthor,
       }).trim(),
     );
-    await this.updateCheckRun(cycle, {
-      conclusion: "action_required",
-      output: {
-        title: "Feature-Rec: rejected",
-        summary: `Validation requested changes. See PR conversation: ${commentUrl}`,
-      },
-    });
+    await withRetry(() =>
+      this.updateCheckRun(cycle, {
+        conclusion: "action_required",
+        output: {
+          title: "Feature-Rec: rejected",
+          summary: `Validation requested changes. See PR conversation: ${commentUrl}`,
+        },
+      }),
+    );
   }
 }
