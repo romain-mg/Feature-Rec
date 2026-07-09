@@ -38,21 +38,35 @@ export async function acceptCycle(
   apiUrl: string,
   cycleId: string,
   classifier: ClassifierResult,
+  attemptId: string,
 ): Promise<void> {
-  await postJson(apiUrl, `/api/runs/${cycleId}/accepted`, classifier);
+  await postJson(apiUrl, `/api/runs/${cycleId}/accepted`, { ...classifier, attemptId });
 }
 
-export async function failCycle(apiUrl: string, cycleId: string, message: string): Promise<void> {
-  await postJson(apiUrl, `/api/runs/${cycleId}/failed`, { message });
+export async function failCycle(
+  apiUrl: string,
+  cycleId: string,
+  message: string,
+  attemptId: string,
+): Promise<void> {
+  await postJson(apiUrl, `/api/runs/${cycleId}/failed`, { message, attemptId });
 }
 
-export async function uploadVideo(apiUrl: string, cycleId: string, file: string): Promise<void> {
+export async function uploadVideo(
+  apiUrl: string,
+  cycleId: string,
+  file: string,
+  attemptId: string,
+): Promise<void> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/octet-stream",
+    Authorization: `Bearer ${runnerToken()}`,
+    // Octet-stream body carries no JSON, so the attempt token rides on a header.
+    "x-feature-rec-attempt": attemptId,
+  };
   const response = await fetch(`${apiUrl}/api/runs/${cycleId}/video`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/octet-stream",
-      Authorization: `Bearer ${runnerToken()}`,
-    },
+    headers,
     body: new Blob([new Uint8Array(fs.readFileSync(file))]),
   });
   if (!response.ok) {

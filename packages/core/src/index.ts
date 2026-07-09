@@ -59,6 +59,8 @@ export const RunStartResponseSchema = z.object({
   cycleId: z.string().min(1),
   cycleKey: z.string().min(1),
   checkRunId: z.number().int().positive().optional(),
+  duplicate: z.boolean().optional(),
+  attemptId: z.string().min(1).optional(),
 });
 export type RunStartResponse = z.infer<typeof RunStartResponseSchema>;
 
