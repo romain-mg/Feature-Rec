@@ -14,11 +14,14 @@ For this hackathon run, Feature-Rec intentionally ignores backend-only product c
 
 ## Local Demo Backend
 
-Start the backend:
+Start the backend (it needs a reachable Postgres and fails startup without `DATABASE_URL`):
 
 ```bash
-pnpm feature-rec:service
+make db     # local Postgres in docker (idempotent)
+make dev    # injects DATABASE_URL and runs the service on :3000
 ```
+
+Or without make: export `DATABASE_URL` yourself and run `pnpm feature-rec:service`. Either way, set `FEATURE_REC_RUNNER_TOKEN` in `.env` — runner calls are rejected with 401 without it.
 
 Expose it:
 
