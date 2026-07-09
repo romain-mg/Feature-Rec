@@ -7,7 +7,7 @@ DB_URL       := postgres://postgres:postgres@localhost:5432/postgres
 help: ## list targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
 
-db: ## start local Postgres 17 (idempotent)
+db: ## start local Postgres 18 (idempotent)
 	@docker info >/dev/null 2>&1 || \
 		{ echo "Docker daemon not running — start Docker Desktop first (open -a Docker)"; exit 1; }
 	@docker start $(DB_CONTAINER) 2>/dev/null || \
@@ -36,4 +36,4 @@ selftest-service: db ## run only the service selftest (the DB-bound one)
 typecheck: ## typecheck all packages
 	pnpm run typecheck
 
-ci: typecheck selftest ## local parity with the CI gate
+ci: typecheck selftest ## typecheck + selftests (planned CI gate minus lint)
