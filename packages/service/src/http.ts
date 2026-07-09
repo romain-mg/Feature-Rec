@@ -8,6 +8,7 @@ import {
 } from "@feature-rec/core";
 import type { ServiceEnv } from "./env";
 import { GitHubClient } from "./github";
+import { withRetry } from "./retry";
 import { SlackClient, verifySlackSignature } from "./slack";
 import type { CycleStore } from "./storage";
 
@@ -59,6 +60,18 @@ function classifierSummary(raw: unknown): string {
 function runnerAuthorized(env: ServiceEnv, header: unknown): boolean {
   if (!env.runnerToken || typeof header !== "string") return false;
   return timingSafeStringEqual(header, `Bearer ${env.runnerToken}`);
+}
+
+function bodyAttemptId(body: unknown): string | undefined {
+  if (body && typeof body === "object") {
+    const value = (body as { attemptId?: unknown }).attemptId;
+    if (typeof value === "string" && value) return value;
+  }
+  return undefined;
+}
+
+function headerAttemptId(header: unknown): string | undefined {
+  return typeof header === "string" && header ? header : undefined;
 }
 
 export function buildServer(input: {
@@ -114,50 +127,135 @@ export function buildServer(input: {
     }
     const start = RunStartRequestSchema.parse(request.body);
     const cycleKey = buildCycleKey(start);
-    const cycle = store.upsertCycle({ ...start, cycleKey });
+    const result = await store.startCycle({ ...start, cycleKey });
 
-    const superseded = store.markSupersededForPr({
-      owner: start.owner,
-      repo: start.repo,
-      prNumber: start.prNumber,
-      exceptHeadSha: start.headSha,
-    });
-    await Promise.all(
-      superseded.map(async (oldCycle) => {
-        await github.updateCheckRun(oldCycle, {
-          conclusion: "neutral",
-          output: {
-            title: "Feature-Rec: superseded",
-            summary: `Superseded by a newer PR head SHA: ${start.headSha}.`,
-          },
-        });
-        await slack.finalize(oldCycle, "superseded", "A newer commit started a fresh validation cycle.");
+    // Duplicate start for the same head: clean no-op exit. No check run is
+    // created and no attemptId is issued, so this runner holds no ownership.
+    // (Duplicates always have an empty superseded[], so no cleanup is skipped.)
+    if (!result.created) {
+      return { duplicate: true, cycleId: result.cycle.id, cycleKey };
+    }
+
+    // Finalize the superseded losers. Fire-and-forget, best-effort by design:
+    // cleanup of old cycles must never delay or fail the active runner's /start
+    // response. The committed DB status (superseded) is authoritative; each
+    // cycle's errors are caught and logged, so the Promise.all cannot reject.
+    void Promise.all(
+      result.superseded.map(async (oldCycle) => {
+        // GitHub and Slack repairs are independent: neither gates the other,
+        // so a GitHub outage can't leave live Slack buttons (or vice versa).
+        const [gh, sl] = await Promise.allSettled([
+          withRetry(() =>
+            github.updateCheckRun(oldCycle, {
+              conclusion: "neutral",
+              output: {
+                title: "Feature-Rec: superseded",
+                summary: `Superseded by a newer PR head SHA: ${start.headSha}.`,
+              },
+            }),
+          ),
+          withRetry(() =>
+            slack.finalize(oldCycle, "superseded", "A newer commit started a fresh validation cycle."),
+          ),
+        ]);
+        if (gh.status === "rejected") {
+          request.log.warn(
+            { err: gh.reason, supersededCycleId: oldCycle.id },
+            "best-effort check-run neutralize of superseded cycle failed",
+          );
+        }
+        if (sl.status === "rejected") {
+          request.log.warn(
+            { err: sl.reason, supersededCycleId: oldCycle.id },
+            "best-effort Slack finalize of superseded cycle failed",
+          );
+        }
       }),
     );
 
-    if (!cycle.checkRunId) {
-      const checkRunId = await github.createCheckRun({ ...start, cycleKey });
-      store.updateCheckRun(cycle.id, checkRunId);
-      return { cycleId: cycle.id, cycleKey, checkRunId };
+    // Takeover of a previously `failed` cycle: reuse its existing check run
+    // (set it back to in_progress) instead of creating a second one, so a
+    // re-run recovers a red check rather than exiting green over a red run.
+    if (result.cycle.checkRunId) {
+      await withRetry(() =>
+        github.updateCheckRun(result.cycle, {
+          status: "in_progress",
+          output: {
+            title: "Feature-Rec: analyzing",
+            summary: "Re-running Feature-Rec after a previous failure.",
+          },
+        }),
+      );
+      return {
+        cycleId: result.cycle.id,
+        cycleKey,
+        checkRunId: result.cycle.checkRunId,
+        attemptId: result.attemptId ?? undefined,
+      };
     }
 
-    return { cycleId: cycle.id, cycleKey, checkRunId: cycle.checkRunId };
+    // Fresh create: only the creator creates the check run, then attaches it atomically.
+    const checkRunId = await github.createCheckRun({ ...start, cycleKey });
+    const statusAfterAttach = await store.attachCheckRun(result.cycle.id, checkRunId);
+    if (statusAfterAttach === "superseded") {
+      // A newer head superseded us between the transaction and the attach; its
+      // neutralize loop saw check_run_id = null, so neutralize what we created.
+      // Best-effort with retry: a transient PATCH failure must not 500 this
+      // request — the runner's start already effectively lost (its results will
+      // no-op as stale), and a retried /start would exit duplicate without
+      // repairing. Now that the ID is attached, a later superseding head can
+      // also see and neutralize it, so a dropped repair here isn't permanent.
+      try {
+        await withRetry(() =>
+          github.updateCheckRun(
+            { owner: start.owner, repo: start.repo, checkRunId },
+            {
+              conclusion: "neutral",
+              output: {
+                title: "Feature-Rec: superseded",
+                summary: "Superseded by a newer PR head SHA before validation started.",
+              },
+            },
+          ),
+        );
+      } catch (err) {
+        request.log.warn(
+          { err, cycleId: result.cycle.id, checkRunId },
+          "best-effort neutralize of own superseded check run failed",
+        );
+      }
+    }
+
+    return {
+      cycleId: result.cycle.id,
+      cycleKey,
+      checkRunId,
+      attemptId: result.attemptId ?? undefined,
+    };
   });
 
   app.post("/api/runs/:cycleId/accepted", async (request, reply) => {
     if (!runnerAuthorized(env, request.headers.authorization)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
-    const cycle = store.getCycle(param(request.params, "cycleId"));
-    if (!cycle) return reply.code(404).send({ error: "cycle not found" });
-    await github.updateCheckRun(cycle, {
-      conclusion: "success",
-      output: {
-        title: "Feature-Rec: accepted",
-        summary: classifierSummary(request.body) || "No frontend-visible validation needed.",
-      },
+    const attemptId = bodyAttemptId(request.body);
+    if (!attemptId) return reply.code(400).send({ error: "attemptId is required" });
+    const cycle = await store.transitionRunnerStatus({
+      cycleId: param(request.params, "cycleId"),
+      attemptId,
+      from: ["analyzing"],
+      to: "accepted",
     });
-    store.updateStatus(cycle.id, "accepted");
+    if (!cycle) return reply.send({ ok: false, stale: true });
+    await withRetry(() =>
+      github.updateCheckRun(cycle, {
+        conclusion: "success",
+        output: {
+          title: "Feature-Rec: accepted",
+          summary: classifierSummary(request.body) || "No frontend-visible validation needed.",
+        },
+      }),
+    );
     return { ok: true };
   });
 
@@ -165,17 +263,25 @@ export function buildServer(input: {
     if (!runnerAuthorized(env, request.headers.authorization)) {
       return reply.code(401).send({ error: "unauthorized" });
     }
-    const cycle = store.getCycle(param(request.params, "cycleId"));
-    if (!cycle) return reply.code(404).send({ error: "cycle not found" });
     const body = request.body as { message?: string } | undefined;
-    await github.updateCheckRun(cycle, {
-      conclusion: "failure",
-      output: {
-        title: "Feature-Rec: failed",
-        summary: body?.message ?? "Feature-Rec failed.",
-      },
+    const attemptId = bodyAttemptId(request.body);
+    if (!attemptId) return reply.code(400).send({ error: "attemptId is required" });
+    const cycle = await store.transitionRunnerStatus({
+      cycleId: param(request.params, "cycleId"),
+      attemptId,
+      from: ["analyzing", "pending_validation"],
+      to: "failed",
     });
-    store.updateStatus(cycle.id, "failed");
+    if (!cycle) return reply.send({ ok: false, stale: true });
+    await withRetry(() =>
+      github.updateCheckRun(cycle, {
+        conclusion: "failure",
+        output: {
+          title: "Feature-Rec: failed",
+          summary: body?.message ?? "Feature-Rec failed.",
+        },
+      }),
+    );
     return { ok: true };
   });
 
@@ -186,57 +292,78 @@ export function buildServer(input: {
       if (!runnerAuthorized(env, request.headers.authorization)) {
         return reply.code(401).send({ error: "unauthorized" });
       }
-      const cycle = store.getCycle(param(request.params, "cycleId"));
-      if (!cycle) return reply.code(404).send({ error: "cycle not found" });
       const video = Buffer.isBuffer(request.body) ? request.body : Buffer.from([]);
       if (video.byteLength === 0) return reply.code(400).send({ error: "empty video body" });
+      const attemptId = headerAttemptId(request.headers["x-feature-rec-attempt"]);
+      if (!attemptId) return reply.code(400).send({ error: "attemptId is required" });
 
-      await github.updateCheckRun(cycle, {
-        status: "in_progress",
-        output: {
-          title: "Feature-Rec: pending validation",
-          summary: "Frontend-visible change rendered and sent to Slack for validation.",
-        },
+      // Transition first (guards against stale/duplicate runners and gives
+      // first-writer-wins idempotency), then run side effects.
+      const cycle = await store.transitionRunnerStatus({
+        cycleId: param(request.params, "cycleId"),
+        attemptId,
+        from: ["analyzing"],
+        to: "pending_validation",
       });
-      store.updateStatus(cycle.id, "pending_validation");
+      if (!cycle) return reply.send({ ok: false, stale: true });
+
+      await withRetry(() =>
+        github.updateCheckRun(cycle, {
+          status: "in_progress",
+          output: {
+            title: "Feature-Rec: pending validation",
+            summary: "Frontend-visible change rendered and sent to Slack for validation.",
+          },
+        }),
+      );
 
       await slack.uploadVideo(cycle.config, cycle, video);
       const message = await slack.postValidation(cycle.config, cycle);
-      store.updateSlackMessage(cycle.id, message.channel, message.ts);
+      const statusAfter = await store.attachSlackMessage(cycle.id, message.channel, message.ts);
+      if (statusAfter === "superseded") {
+        // Superseded after the transition but before the Slack post landed:
+        // finalize the message we just posted so it can't strand in Slack.
+        // Retried: nobody else will ever repair this message (the superseder's
+        // cleanup already ran and saw no coordinates), and chat.update is idempotent.
+        await withRetry(() =>
+          slack.finalize(
+            { ...cycle, slackChannelId: message.channel, slackMessageTs: message.ts },
+            "superseded",
+            "A newer commit started a fresh validation cycle.",
+          ),
+        );
+      }
       return { ok: true, channel: message.channel, ts: message.ts };
     },
   );
 
   app.post("/api/slack/interactivity", async (request, reply) => {
     const rawBody = String(request.body ?? "");
-    const valid = verifySlackSignature({
+    const signatureOk = verifySlackSignature({
       signingSecret: env.slackSigningSecret,
-      timestamp: String(request.headers["x-slack-request-timestamp"] ?? ""),
-      signature: String(request.headers["x-slack-signature"] ?? ""),
+      timestamp: request.headers["x-slack-request-timestamp"] as string | undefined,
+      signature: request.headers["x-slack-signature"] as string | undefined,
       rawBody,
     });
-    if (!valid) return reply.code(401).send("invalid signature");
+    if (!signatureOk) return reply.code(401).send({ error: "invalid slack signature" });
 
-    const form = new URLSearchParams(rawBody);
-    const payload = JSON.parse(String(form.get("payload") ?? "{}")) as SlackPayload;
-
+    const payloadParam = new URLSearchParams(rawBody).get("payload");
+    if (!payloadParam) return reply.code(400).send({ error: "missing payload" });
+    const payload = JSON.parse(payloadParam) as SlackPayload;
     if (payload.type === "block_actions") {
-      reply.send("");
       void handleBlockAction(payload).catch((err) => app.log.error(err));
-      return;
+      return reply.send("");
     }
-
     if (payload.type === "view_submission") {
       const comment = extractModalComment(payload);
       if (!comment.trim()) {
         return reply.send({
           response_action: "errors",
-          errors: { comment: "A comment is required." },
+          errors: { comment: "Please describe what needs to change." },
         });
       }
-      reply.send({});
       void handleViewSubmission(payload, comment).catch((err) => app.log.error(err));
-      return;
+      return reply.send("");
     }
 
     return reply.send("");
@@ -247,22 +374,32 @@ export function buildServer(input: {
     const value = SlackApprovalPayloadSchema.parse(JSON.parse(action?.value ?? "{}"));
     const interactionId = `block:${payload.trigger_id ?? ""}:${action?.action_ts ?? ""}:${value.action}`;
 
-    const cycle = store.getCycle(value.cycleId);
+    const cycle = await store.getCycle(value.cycleId);
     if (!cycle) return;
     if (!(await slack.isApprover(cycle.config, payload.user?.id))) {
       app.log.warn({ cycleId: cycle.id, slackUserId: payload.user?.id }, "unauthorized Slack approver");
       return;
     }
-    if (!store.recordProcessedInteraction(interactionId, value.cycleId)) return;
-    if (cycle.status === "superseded" || cycle.headSha !== value.headSha) {
-      await slack.finalize(cycle, "superseded", "This validation request is stale.");
-      return;
-    }
+    if (!(await store.recordProcessedInteraction(interactionId, value.cycleId))) return;
 
     if (value.action === "accept") {
-      await github.accept(cycle, cycle.config.github.acceptComment);
-      store.updateStatus(cycle.id, "accepted");
-      await slack.finalize(cycle, "accepted", "Validation passed.");
+      // Transition-first: two distinct clicks both pass dedupe, so the status
+      // guard is what serializes them. Stop on null (stale or lost the race).
+      const accepted = await store.transitionSlackStatus({
+        cycleId: cycle.id,
+        from: ["pending_validation"],
+        to: "accepted",
+      });
+      if (!accepted) return;
+      // No withRetry around accept: the comment POST inside is not idempotent;
+      // the check-run PATCH retries internally (see GitHubClient.accept).
+      // GitHub and Slack effects run independently: the DB already settled the
+      // cycle, so a GitHub failure must not skip the Slack finalize (live
+      // buttons on a decided cycle), nor vice versa.
+      await settleSideEffects(accepted.id, [
+        ["github accept", github.accept(accepted, accepted.config.github.acceptComment)],
+        ["slack finalize", withRetry(() => slack.finalize(accepted, "accepted", "Validation passed."))],
+      ]);
       return;
     }
 
@@ -275,20 +412,38 @@ export function buildServer(input: {
     const meta = JSON.parse(payload.view?.private_metadata ?? "{}") as { cycleId?: string; headSha?: string };
     const cycleId = meta.cycleId ?? "";
     const interactionId = `view:${payload.view?.id ?? ""}:${payload.view?.hash ?? ""}`;
-    const cycle = store.getCycle(cycleId);
+    const cycle = await store.getCycle(cycleId);
     if (!cycle) return;
     if (!(await slack.isApprover(cycle.config, payload.user?.id))) {
       app.log.warn({ cycleId: cycle.id, slackUserId: payload.user?.id }, "unauthorized Slack approver");
       return;
     }
-    if (!store.recordProcessedInteraction(interactionId, cycleId)) return;
-    if (cycle.status === "superseded" || cycle.headSha !== meta.headSha) {
-      await slack.finalize(cycle, "superseded", "This validation request is stale.");
-      return;
-    }
-    await github.reject(cycle, cycle.config.github.rejectComment, comment.trim());
-    store.updateStatus(cycle.id, "rejected");
-    await slack.finalize(cycle, "rejected", comment.trim());
+    if (!(await store.recordProcessedInteraction(interactionId, cycleId))) return;
+
+    const rejected = await store.transitionSlackStatus({
+      cycleId: cycle.id,
+      from: ["pending_validation"],
+      to: "rejected",
+    });
+    if (!rejected) return;
+    // No withRetry around reject: comment POST is not idempotent; the check-run
+    // PATCH retries internally (see GitHubClient.reject). GitHub and Slack
+    // effects run independently (see accept path for rationale).
+    await settleSideEffects(rejected.id, [
+      ["github reject", github.reject(rejected, rejected.config.github.rejectComment, comment.trim())],
+      ["slack finalize", withRetry(() => slack.finalize(rejected, "rejected", comment.trim()))],
+    ]);
+  }
+
+  // Runs post-commit side effects independently and logs each failure without
+  // letting one channel's outage suppress the other's repair.
+  async function settleSideEffects(cycleId: string, effects: Array<[string, Promise<unknown>]>): Promise<void> {
+    const results = await Promise.allSettled(effects.map(([, p]) => p));
+    results.forEach((res, i) => {
+      if (res.status === "rejected") {
+        app.log.warn({ err: res.reason, cycleId, effect: effects[i][0] }, "post-commit side effect failed");
+      }
+    });
   }
 
   return app;

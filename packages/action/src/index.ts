@@ -62,6 +62,19 @@ async function main(): Promise<void> {
     config,
   });
 
+  // Same-head duplicate: another runner already owns this cycle. Exit cleanly
+  // before any work so no duplicate check runs, video uploads, or Slack posts.
+  if (started.duplicate) {
+    console.log(`Feature-Rec: duplicate start for ${started.cycleKey}; another run owns this cycle. Exiting.`);
+    return;
+  }
+  // A non-duplicate start always returns an attempt token; its absence is a
+  // backend contract violation, so fail loud rather than send token-less calls.
+  const attemptId = started.attemptId;
+  if (!attemptId) {
+    throw new Error("Feature-Rec: backend returned no attemptId for a new cycle.");
+  }
+
   try {
     const diff = collectDiffContext({
       repoRoot,
@@ -78,7 +91,7 @@ async function main(): Promise<void> {
     console.log(`Feature-Rec classifier: ${JSON.stringify(classifier, null, 2)}`);
 
     if (!classifier.frontendVisible) {
-      await acceptCycle(apiUrl, started.cycleId, classifier);
+      await acceptCycle(apiUrl, started.cycleId, classifier, attemptId);
       return;
     }
 
@@ -97,10 +110,10 @@ async function main(): Promise<void> {
       sources,
       offline: process.env.FEATURE_REC_OFFLINE === "1",
     });
-    await uploadVideo(apiUrl, started.cycleId, video);
+    await uploadVideo(apiUrl, started.cycleId, video, attemptId);
   } catch (err) {
     const message = err instanceof Error ? err.stack ?? err.message : String(err);
-    await failCycle(apiUrl, started.cycleId, message);
+    await failCycle(apiUrl, started.cycleId, message, attemptId);
     throw err;
   }
 }

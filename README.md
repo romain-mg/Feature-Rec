@@ -39,7 +39,7 @@ The repository is a pnpm monorepo with these main pieces:
 | Path | Purpose |
 | --- | --- |
 | `packages/action` | GitHub Action entrypoint. It reads the PR event, classifies the diff, invokes the video renderer when needed, and calls the backend. |
-| `packages/service` | Fastify backend for Slack uploads, Slack button handling, GitHub Check Runs, PR comments, and SQLite-backed review state. |
+| `packages/service` | Fastify backend for Slack uploads, Slack button handling, GitHub Check Runs, PR comments, and Postgres-backed review state. |
 | `packages/core` | Shared schemas, config parsing, template helpers, and action/service contracts. |
 | `packages/cli` | Renderer CLI: analyze a UI change, generate or reuse a Remotion scene, render video, and write release artifacts. |
 | `packages/video` | Remotion project used to render the generated scenes. |
