@@ -146,25 +146,40 @@ export function buildServer(input: {
     const cycleKey = buildCycleKey(start);
     const result = await store.startCycle({ ...start, cycleKey });
 
-    // Supersession only runs for newly created cycles; finalize the losers.
-    await Promise.all(
-      result.superseded.map(async (oldCycle) => {
-        await github.updateCheckRun(oldCycle, {
-          conclusion: "neutral",
-          output: {
-            title: "Feature-Rec: superseded",
-            summary: `Superseded by a newer PR head SHA: ${start.headSha}.`,
-          },
-        });
-        await slack.finalize(oldCycle, "superseded", "A newer commit started a fresh validation cycle.");
-      }),
-    );
-
     // Duplicate start for the same head: clean no-op exit. No check run is
     // created and no attemptId is issued, so this runner holds no ownership.
+    // (Duplicates always have an empty superseded[], so no cleanup is skipped.)
     if (!result.created) {
       return { duplicate: true, cycleId: result.cycle.id, cycleKey };
     }
+
+    // Finalize the superseded losers. Fire-and-forget, best-effort by design:
+    // cleanup of old cycles must never delay or fail the active runner's /start
+    // response. The committed DB status (superseded) is authoritative; each
+    // cycle's errors are caught and logged, so the Promise.all cannot reject.
+    void Promise.all(
+      result.superseded.map(async (oldCycle) => {
+        try {
+          await withRetry(() =>
+            github.updateCheckRun(oldCycle, {
+              conclusion: "neutral",
+              output: {
+                title: "Feature-Rec: superseded",
+                summary: `Superseded by a newer PR head SHA: ${start.headSha}.`,
+              },
+            }),
+          );
+          await withRetry(() =>
+            slack.finalize(oldCycle, "superseded", "A newer commit started a fresh validation cycle."),
+          );
+        } catch (err) {
+          request.log.warn(
+            { err, supersededCycleId: oldCycle.id },
+            "best-effort finalize of superseded cycle failed",
+          );
+        }
+      }),
+    );
 
     // Takeover of a previously `failed` cycle: reuse its existing check run
     // (set it back to in_progress) instead of creating a second one, so a
@@ -314,34 +329,31 @@ export function buildServer(input: {
 
   app.post("/api/slack/interactivity", async (request, reply) => {
     const rawBody = String(request.body ?? "");
-    const valid = verifySlackSignature({
+    const signatureOk = verifySlackSignature({
       signingSecret: env.slackSigningSecret,
-      timestamp: String(request.headers["x-slack-request-timestamp"] ?? ""),
-      signature: String(request.headers["x-slack-signature"] ?? ""),
+      timestamp: request.headers["x-slack-request-timestamp"] as string | undefined,
+      signature: request.headers["x-slack-signature"] as string | undefined,
       rawBody,
     });
-    if (!valid) return reply.code(401).send("invalid signature");
+    if (!signatureOk) return reply.code(401).send({ error: "invalid slack signature" });
 
-    const form = new URLSearchParams(rawBody);
-    const payload = JSON.parse(String(form.get("payload") ?? "{}")) as SlackPayload;
-
+    const payloadParam = new URLSearchParams(rawBody).get("payload");
+    if (!payloadParam) return reply.code(400).send({ error: "missing payload" });
+    const payload = JSON.parse(payloadParam) as SlackPayload;
     if (payload.type === "block_actions") {
-      reply.send("");
       void handleBlockAction(payload).catch((err) => app.log.error(err));
-      return;
+      return reply.send("");
     }
-
     if (payload.type === "view_submission") {
       const comment = extractModalComment(payload);
       if (!comment.trim()) {
         return reply.send({
           response_action: "errors",
-          errors: { comment: "A comment is required." },
+          errors: { comment: "Please describe what needs to change." },
         });
       }
-      reply.send({});
       void handleViewSubmission(payload, comment).catch((err) => app.log.error(err));
-      return;
+      return reply.send("");
     }
 
     return reply.send("");

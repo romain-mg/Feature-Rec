@@ -9,3 +9,5 @@ dist/
 !.env.example
 .remotion/
 *.tsbuildinfo
+feature-rec-testbed/
+.pnpm-store/

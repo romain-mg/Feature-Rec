@@ -15,7 +15,7 @@ import { PostgresCycleStore } from "../src/storage/postgres";
 // Requires a Postgres reachable at TEST_DATABASE_URL (an admin/maintenance DB).
 // The suite creates a uniquely named database, runs against it, then drops it,
 // so parallel CI runs can't collide. Local one-liner:
-//   docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:17
+//   docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:18
 const adminUrl =
   process.env.TEST_DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/postgres";
 
@@ -426,10 +426,39 @@ try {
     assert.equal(github.createCheckRunCalls, 2);
 
     assert.ok(loser.checkRunId);
-    assert.equal(github.checkRuns.get(loser.checkRunId)?.conclusion, "neutral");
+    assert.ok(
+      await waitFor(async () => github.checkRuns.get(loser.checkRunId ?? 0)?.conclusion === "neutral"),
+    );
     if (winner.checkRunId) {
       assert.notEqual(github.checkRuns.get(winner.checkRunId)?.conclusion, "neutral");
     }
+  }
+
+  // --- Superseded cleanup is best-effort: a failed old check update must not block the new run ---
+  {
+    const github = makeGithubStub();
+    const app = makeApp(github, makeSlackStub());
+    const first = (await startRun(app, makeStart(14, { headSha: "cleanup001a" }))).body;
+    assert.ok(first.checkRunId);
+
+    let cleanupAttempts = 0;
+    const updateCheckRun = github.updateCheckRun;
+    github.updateCheckRun = async (cycle, input): Promise<void> => {
+      if (cycle.checkRunId === first.checkRunId) {
+        cleanupAttempts += 1;
+        throw new Error("cleanup failed");
+      }
+      await updateCheckRun(cycle, input);
+    };
+
+    const second = await startRun(app, makeStart(14, { headSha: "cleanup002b" }));
+    assert.equal(second.res.statusCode, 200);
+    assert.ok(second.body.checkRunId);
+    assert.ok(second.body.attemptId);
+    assert.equal(github.createCheckRunCalls, 2);
+    assert.equal((await store.getCycle(second.body.cycleId ?? ""))?.checkRunId, second.body.checkRunId);
+    assert.ok(await waitFor(async () => cleanupAttempts > 0));
+    assert.equal((await store.getCycle(first.cycleId ?? ""))?.status, "superseded");
   }
 
   // --- (b) same-head duplicate start: one created, one duplicate, one check run ---
