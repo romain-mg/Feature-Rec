@@ -1,6 +1,6 @@
 # CI Plan
 
-The repo currently has **no CI** (`.github/` holds only app config, no workflows). Because the service runs via `tsx`, which strips types without checking them, nothing today prevents merging code that doesn't compile. CI is the missing gate the Postgres migration plan leans on (its step 9 assumes typecheck + selftests run somewhere enforced).
+The repo currently has **no CI** (`.github/` holds only app config, no workflows). Because the service runs via `tsx`, which strips types without checking them, nothing today prevents merging code that doesn't compile. CI is the missing gate the Postgres migration plan leans on (its verification step assumes typecheck + selftests run somewhere enforced).
 
 Scope: one GitHub Actions workflow, no deploy stages, no matrix. Small on purpose.
 

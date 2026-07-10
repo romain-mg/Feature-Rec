@@ -17,9 +17,10 @@ runs:
         set -euo pipefail
         corepack enable
         ACTION_REPO_ROOT="$(cd "$GITHUB_ACTION_PATH/../.." && pwd)"
-        pnpm --dir "$ACTION_REPO_ROOT" install --frozen-lockfile --ignore-scripts
-        pnpm --dir "$ACTION_REPO_ROOT" rebuild esbuild
-        pnpm --dir "$ACTION_REPO_ROOT" --filter @feature-rec/action run start -- \
+        cd "$ACTION_REPO_ROOT"
+        pnpm install --frozen-lockfile --ignore-scripts
+        pnpm rebuild esbuild
+        pnpm --filter @feature-rec/action run start -- \
           --repo "$GITHUB_WORKSPACE" \
           --config "$GITHUB_WORKSPACE/${{ inputs.config }}" \
           --api-url "${{ inputs.api-url }}" \

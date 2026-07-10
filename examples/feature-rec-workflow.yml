@@ -1,4 +1,4 @@
-name: Feature-Rec
+name: Feature-Rec Runner
 
 on:
   pull_request:
@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   feature-rec:
+    name: Analyze and render
     if: >
       github.event.pull_request.state == 'open' &&
       github.event.pull_request.draft == false &&
@@ -29,9 +30,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: MathFreedom/Agora/packages/action@codex/feature-rec
+      - uses: Hanibzd/Feature-Rec/packages/action@main
         with:
-          config: .github/feature-rec-config.yaml
+          config: .github/feature-rec-config.yml
           api-url: ${{ vars.FEATURE_REC_API_URL }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

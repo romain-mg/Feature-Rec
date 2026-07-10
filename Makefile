@@ -24,7 +24,10 @@ db-stop: ## stop the Postgres container
 db-clean: ## remove the Postgres container and its data
 	docker rm -f $(DB_CONTAINER)
 
-dev: db ## run the service locally against local Postgres
+dev: db ## load .env and run the service locally against local Postgres
+	@set -a; \
+	if [ -f .env ]; then . ./.env; fi; \
+	set +a; \
 	DATABASE_URL=$(DB_URL) pnpm feature-rec:service
 
 selftest: db ## run all selftests (core + service + action)
