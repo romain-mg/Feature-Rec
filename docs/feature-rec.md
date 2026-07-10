@@ -41,10 +41,15 @@ FEATURE_REC_RUNNER_TOKEN=<shared secret matching the backend env>
 Create a GitHub App with:
 
 - Checks: read/write
-- Pull requests: read
+- Pull requests: read/write
 - Issues: read/write
 - Contents: read
 - Metadata: read
+
+Pull request write access is required for the approval and rejection comments that Feature-Rec posts
+to the PR conversation. If you add or increase permissions after installing the App, approve the
+updated permissions on the existing installation (or reinstall the App), then restart the backend so
+it mints an installation token with the new grants.
 
 Set local env vars:
 
