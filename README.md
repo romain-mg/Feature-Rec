@@ -127,7 +127,7 @@ Copy the example files into the target repository:
 
 ```text
 examples/feature-rec-config.yaml -> .github/feature-rec-config.yaml
-examples/feature-rec-workflow.yml -> .github/workflows/feature-rec.yml
+examples/feature-rec-workflow.yaml -> .github/workflows/feature-rec.yaml
 ```
 
 Configure the Slack app interactivity URL:
@@ -151,16 +151,27 @@ target repository to start the review loop.
 | `pnpm publish --post` | Post the generated PR comment with the GitHub CLI. |
 | `pnpm studio` | Open the Remotion Studio. |
 | `pnpm typecheck` | Type-check all workspace packages. |
+| `pnpm lint` | Run type-aware lint checks across workspace packages. |
+| `pnpm selftest` | Run all core, service, action, and CLI self-tests. |
+| `make ci` | Run the complete local CI gate with Docker-managed Postgres. |
 | `pnpm feature-rec:service` | Start the local Feature-Rec backend on `PORT` or `3000`. |
 | `pnpm feature-rec:selftest` | Run self-tests for core, service, and action packages. |
 
 ## Validate
 
-Run the project checks from the repository root:
+Run the complete project gate from the repository root:
+
+```bash
+make ci
+```
+
+This starts or reuses the Docker-managed Postgres instance, then runs the same application checks
+as GitHub Actions:
 
 ```bash
 pnpm typecheck
-pnpm feature-rec:selftest
+pnpm lint
+pnpm selftest
 ```
 
 For detailed Feature-Rec setup, permissions, and smoke checks, read

@@ -32,7 +32,7 @@ jobs:
 
       - uses: Hanibzd/Feature-Rec/packages/action@main
         with:
-          config: .github/feature-rec-config.yml
+          config: .github/feature-rec-config.yaml
           api-url: ${{ vars.FEATURE_REC_API_URL }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

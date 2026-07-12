@@ -2,7 +2,7 @@ DB_CONTAINER := feature-rec-pg
 DB_URL       := postgres://postgres:postgres@localhost:5432/postgres
 
 .DEFAULT_GOAL := help
-.PHONY: help db db-wait db-stop db-clean dev selftest selftest-service typecheck ci
+.PHONY: help db db-wait db-stop db-clean dev selftest selftest-service typecheck lint ci
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -30,8 +30,8 @@ dev: db ## load .env and run the service locally against local Postgres
 	set +a; \
 	DATABASE_URL=$(DB_URL) pnpm feature-rec:service
 
-selftest: db ## run all selftests (core + service + action)
-	TEST_DATABASE_URL=$(DB_URL) pnpm feature-rec:selftest
+selftest: db ## run all selftests
+	TEST_DATABASE_URL=$(DB_URL) pnpm selftest
 
 selftest-service: db ## run only the service selftest (the DB-bound one)
 	TEST_DATABASE_URL=$(DB_URL) pnpm --filter @feature-rec/service run selftest
@@ -39,4 +39,7 @@ selftest-service: db ## run only the service selftest (the DB-bound one)
 typecheck: ## typecheck all packages
 	pnpm run typecheck
 
-ci: typecheck selftest ## typecheck + selftests (planned CI gate minus lint)
+lint: ## lint all packages
+	pnpm run lint
+
+ci: typecheck lint selftest ## reproduce the GitHub Actions checks locally

@@ -91,7 +91,7 @@ Invite the bot to the configured channel. If `slack.approverUsergroups` is set i
 Copy:
 
 - `examples/feature-rec-config.yaml` to `.github/feature-rec-config.yaml`
-- `examples/feature-rec-workflow.yml` to `.github/workflows/feature-rec.yml`
+- `examples/feature-rec-workflow.yaml` to `.github/workflows/feature-rec.yaml`
 
 Set the LLM secret used by the action:
 

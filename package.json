@@ -5,7 +5,7 @@
   "description": "AutoDemo — every release publishes its own video, automatically. Reads the UI diff, reproduces the changed interface 1:1 in Remotion, animates the new element, renders an MP4.",
   "packageManager": "pnpm@11.9.0",
   "engines": {
-    "node": ">=22"
+    "node": "^22.13.0 || >=24"
   },
   "scripts": {
     "demo": "pnpm --filter @autodemo/cli run demo",
@@ -14,10 +14,14 @@
     "publish": "pnpm --filter @autodemo/cli run publish",
     "studio": "pnpm --filter @autodemo/video run studio",
     "typecheck": "pnpm -r run typecheck",
+    "lint": "eslint \"packages/**/*.{ts,tsx,mts}\" --max-warnings=0",
     "feature-rec:service": "pnpm --filter @feature-rec/service run dev",
-    "feature-rec:selftest": "pnpm --filter @feature-rec/core run selftest && pnpm --filter @feature-rec/service run selftest && pnpm --filter @feature-rec/action run selftest"
+    "feature-rec:selftest": "pnpm --filter @feature-rec/core run selftest && pnpm --filter @feature-rec/service run selftest && pnpm --filter @feature-rec/action run selftest",
+    "selftest": "pnpm feature-rec:selftest && pnpm --filter @autodemo/cli run selftest"
   },
   "devDependencies": {
-    "typescript": "^5.7.3"
+    "eslint": "^10.6.0",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.63.0"
   }
 }
