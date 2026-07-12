@@ -3,7 +3,7 @@ import { classifyFrontendVisible, extractClassifierJson } from "../src/classifie
 import { collectDiffContext, heuristicFrontendVisible } from "../src/diff";
 
 assert.equal(
-  heuristicFrontendVisible(["README.md", ".github/workflows/ci.yml"], "").frontendVisible,
+  heuristicFrontendVisible(["README.md", ".github/workflows/ci.yaml"], "").frontendVisible,
   false,
 );
 assert.equal(

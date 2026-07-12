@@ -14,7 +14,8 @@
     "render": "tsx src/index.ts render",
     "publish": "tsx src/index.ts publish",
     "demo": "tsx src/index.ts demo",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "selftest": "tsx scripts/validate-selftest.mts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.106.0",

@@ -1,19 +1,103 @@
 # CI Plan
 
-The repo currently has **no CI** (`.github/` holds only app config, no workflows). Because the service runs via `tsx`, which strips types without checking them, nothing today prevents merging code that doesn't compile. CI is the missing gate the Postgres migration plan leans on (its verification step assumes typecheck + selftests run somewhere enforced).
+The repository currently has no CI workflow. The service and action run TypeScript through `tsx`, so pull requests need an enforced gate that performs typechecking, type-aware linting, and every existing selftest before merge.
 
-Scope: one GitHub Actions workflow, no deploy stages, no matrix. Small on purpose.
+Scope: one GitHub Actions workflow, one validation job, no deploy stages, build matrix, or Docker image build. The workflow covers the five packages in the pnpm workspace. `apps/web` is intentionally excluded because it is a standalone demo application with its own dependency graph and no lockfile; give it a separate build workflow if it becomes a shipped or supported application.
 
-## Workflow: `.github/workflows/ci.yml`
+## Workflow: `.github/workflows/ci.yaml`
 
-Triggers: `pull_request` and `push` to `main`.
+Use a stable workflow and job name so branch protection can require an unambiguous check:
 
-Single job (the repo is small enough that parallel jobs buy latency but cost setup duplication; split later if it slows):
+```yaml
+name: Repository CI
 
-1. **Setup**: checkout; `corepack enable` (repo pins `pnpm@11.9.0` via `packageManager`); Node 22 via `actions/setup-node` with `cache: pnpm`; `pnpm install --frozen-lockfile` — frozen so a `package.json`/lockfile drift (the thing step 1 of the migration plan warns about) fails loudly here.
-2. **Typecheck**: `pnpm -r typecheck`, backed by a new `"typecheck": "tsc --noEmit"` script added to each package. This is the gate that `tsx` removed — non-negotiable, runs first because it's the fastest failure.
-3. **Lint**: minimal flat-config ESLint with `typescript-eslint`, only rules that catch bug classes the reviews actually hit — `@typescript-eslint/no-floating-promises` and `no-misused-promises` (the `if (!promiseReturningCall())` family from the async store migration). Not a style linter; keep the rule set under ten.
-4. **Selftests**: `pnpm feature-rec:selftest` (core + service + action aggregate). The service selftest needs Postgres, provided as a workflow service container:
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+```
+
+Only `pull_request` is needed. Branch protection on `main` will require pull requests and block direct pushes. If GitHub merge queues are enabled later, add the `merge_group` trigger so the queued merge commit receives the same check.
+
+## Job
+
+Keep the checks in one job: the repository is small, and separate jobs would repeat dependency installation and Postgres setup.
+
+### 1. Setup
+
+1. Check out the repository with `actions/checkout@v4`.
+2. Install pnpm with `pnpm/action-setup@v4` and `run_install: false`. With no explicit action version input, it uses the repository's `packageManager` field (`pnpm@11.9.0`). This happens before `setup-node` so pnpm is available when the Node action configures its cache.
+3. Install Node 22 with `actions/setup-node@v4`, `cache: pnpm`, and `cache-dependency-path: pnpm-lock.yaml`.
+4. Run `pnpm install --frozen-lockfile`. A package-manifest change without its lockfile must fail CI.
+
+### 2. Typecheck
+
+Run the existing root command:
+
+```bash
+pnpm typecheck
+```
+
+It delegates to the existing `typecheck` scripts in all five workspace packages. Update `packages/cli/tsconfig.json` to include `scripts` and set `rootDir` to `.` so its validation selftest is typechecked as well as executed.
+
+### 3. Type-aware lint
+
+Add root development dependencies on `eslint` and `typescript-eslint`, plus a root flat config. Keep the rules focused on asynchronous correctness rather than formatting:
+
+- Configure the TypeScript parser with `parserOptions.projectService: true` and the repository root as `tsconfigRootDir`.
+- Lint `packages/**/*.{ts,tsx,mts}`; ignore generated dependency/build directories.
+- Enable `@typescript-eslint/no-floating-promises` as an error.
+- Enable `@typescript-eslint/no-misused-promises` as an error. Its conditional checks catch code such as `if (!promiseReturningCall())`.
+- Add a root script such as `"lint": "eslint \"packages/**/*.{ts,tsx,mts}\" --max-warnings=0"`.
+
+Run:
+
+```bash
+pnpm lint
+```
+
+The lint command must use type information; a syntax-only ESLint configuration would not enforce either promise rule correctly.
+
+### 4. Standardize package selftest commands
+
+Every package that contains tests must expose them through a package-level `selftest` script. Root scripts should only orchestrate those package commands; they should not reach into a package to execute a test file directly. This keeps each package independently testable and gives CI one stable repository-wide entry point.
+
+For the CLI, add `"selftest": "tsx scripts/validate-selftest.mts"` to `packages/cli/package.json`. Keep the existing `selftest` scripts in core, service, and action.
+
+The resulting command structure is:
+
+```text
+package selftest          -> tests one package
+feature-rec:selftest      -> orchestrates core, service, and action
+root selftest             -> orchestrates feature-rec:selftest and CLI selftest
+```
+
+### 5. Selftests
+
+The current `feature-rec:selftest` command covers core, service, and action. The repository also has a passing CLI validation suite that must not remain a manual-only smoke check.
+
+Add:
+
+- A root `selftest` command that runs `feature-rec:selftest` and the CLI selftest.
+
+CI then runs:
+
+```bash
+pnpm selftest
+```
+
+The service selftest needs an administrative Postgres connection. Provide Postgres as a job service:
 
 ```yaml
 services:
@@ -29,15 +113,41 @@ env:
   TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
 ```
 
-Matches the selftest contract from the migration plan (admin URL; the test creates/drops its own uniquely named database, so parallel CI runs can't collide).
+The service selftest creates a uniquely named database, closes its connections, and drops the database in cleanup, so parallel or retried workflow runs do not collide.
 
-## Deliberately out of scope (add when the trigger happens)
+## Local parity
 
-- **Build/publish artifact** — when the service is containerized, add a `tsup`/esbuild bundle job then; until then `tsx` is the runtime and there is nothing to build.
-- **Action packaging check** — if/when `packages/action` is published for external consumers, add a job verifying the committed dist matches source.
-- **Migration-drift check** — if migration count grows, a one-line assertion that files in `migrations/` equal static-map entries (see migration plan, step 3).
-- **Coverage, release automation, deploy pipelines** — nothing to deploy from CI yet.
+Update the Makefile so:
+
+- `selftest` runs the new root `pnpm selftest` aggregate.
+- `ci` depends on `typecheck`, `lint`, and `selftest`.
+
+After that change, `make ci` reproduces the GitHub Actions checks locally, using the existing Docker-managed Postgres instance.
+
+## Branch protection
+
+The GitHub Actions job and the Feature-Rec application Check Run are separate gates. Configure branch protection or a repository ruleset for `main` to:
+
+1. Require changes to arrive through a pull request, which blocks direct pushes.
+2. Require the GitHub Actions check named `CI`.
+3. Apply the rule to any users or roles that should not be allowed to bypass these gates.
+
+Update the README and `docs/feature-rec.md` during implementation so they instruct maintainers to require both checks, rather than presenting either check as a replacement for the other.
+
+## Deliberately out of scope
+
+- **Docker image build and smoke test** — add these after the Dockerfile lands. The initial CI gate does not depend on an application image because Postgres is supplied as a workflow service.
+- **Standalone web demo** — add a dedicated lockfile and build workflow if `apps/web` becomes a supported deliverable.
+- **Bundled action packaging check** — add this if the composite action is converted to a committed JavaScript distribution.
+- **Migration-drift check** — add an assertion that migration files match the static import map when the migration count grows.
+- **Coverage, release automation, and deployment** — add them when the repository has corresponding thresholds or deployable artifacts.
 
 ## Definition of done
 
-A PR that fails typecheck, lint, or any selftest cannot merge (branch protection on `main` requiring the workflow). Local parity: `make ci` (typecheck + selftests against local docker Postgres) reproduces the gate *minus lint* — no ESLint config exists yet, so local parity is exact only once step 3's lint setup lands. Update `make ci` to include lint at that point.
+- A pull request runs the stable `CI` check.
+- Installation fails on manifest/lockfile drift.
+- All workspace source and test code typechecks.
+- Both type-aware promise rules run and fail CI on violations.
+- Core, service, action, and CLI selftests pass.
+- `make ci` runs the same application checks locally.
+- Branch protection is verified with a test pull request: neither a failing `CI` check nor a failing `Feature-Rec` check can merge, and direct pushes to `main` are blocked.
