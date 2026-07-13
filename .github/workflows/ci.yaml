@@ -38,7 +38,7 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
 
@@ -53,3 +53,32 @@ jobs:
 
       - name: Selftests
         run: pnpm selftest
+
+      - name: Build service image
+        run: docker build --tag feature-rec-service:ci .
+
+      - name: Smoke test service image
+        run: |
+          docker run --detach --name feature-rec-service-ci --network host \
+            --env DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
+            --env FEATURE_REC_RUNNER_TOKEN=ci-smoke-test \
+            feature-rec-service:ci
+
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:3000/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          exit 1
+
+      - name: Print service logs on failure
+        if: failure()
+        run: docker logs feature-rec-service-ci || true
+
+      - name: Clean up service image
+        if: always()
+        run: |
+          docker stop --timeout 10 feature-rec-service-ci || true
+          docker rm feature-rec-service-ci || true

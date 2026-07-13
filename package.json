@@ -5,7 +5,7 @@
   "description": "AutoDemo — every release publishes its own video, automatically. Reads the UI diff, reproduces the changed interface 1:1 in Remotion, animates the new element, renders an MP4.",
   "packageManager": "pnpm@11.9.0",
   "engines": {
-    "node": "^22.13.0 || >=24"
+    "node": "^24.0.0"
   },
   "scripts": {
     "demo": "pnpm --filter @autodemo/cli run demo",

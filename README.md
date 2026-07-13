@@ -57,7 +57,7 @@ repository setup.
 
 Requirements:
 
-- Node.js 20 or newer
+- Node.js 24
 - pnpm 11.9.0 or compatible
 - GitHub CLI only if you use `pnpm publish --post`
 
@@ -139,6 +139,60 @@ https://<public-tunnel-host>/api/slack/interactivity
 Then require the `Feature-Rec` Check Run in branch protection. Open or update a ready PR in the
 target repository to start the review loop.
 
+## Build the Backend Image
+
+The production service runs compiled JavaScript in a provider-neutral Node.js 24 image. Build it
+from the repository root so Docker can access both `packages/service` and its shared
+`packages/core` dependency:
+
+```bash
+docker build -t feature-rec-service:local .
+```
+
+To run it locally against the Makefile-managed Postgres instance on Docker Desktop:
+
+```bash
+make db
+docker run --rm --name feature-rec-service -p 3000:3000 \
+  --env-file .env \
+  -e DATABASE_URL=postgres://postgres:postgres@host.docker.internal:5432/postgres \
+  feature-rec-service:local
+```
+
+On Linux, add `--add-host=host.docker.internal:host-gateway` to the `docker run` command. Check the
+running image with `curl http://localhost:3000/health`.
+
+## Host the Backend on Railway
+
+Railway builds the root `Dockerfile`; it does not use Railpack or require a prebuilt registry image.
+Create one backend service from this repository with root directory `/`, then add a separate Railway
+Postgres service. Configure the backend with:
+
+```text
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+FEATURE_REC_BASE_URL=https://feature-rec.example.com
+FEATURE_REC_RUNNER_TOKEN=<strong shared secret>
+GITHUB_APP_ID=<app id>
+GITHUB_PRIVATE_KEY=<private key>
+SLACK_BOT_TOKEN=<bot token>
+SLACK_SIGNING_SECRET=<signing secret>
+```
+
+Railway supplies `PORT`; do not set it manually. The service runs migrations before listening, and
+Railway uses `/health` as its deployment readiness check. No volume is attached to the backend;
+durable state belongs in Postgres.
+
+Enable GitHub Autodeploys for the protected `main` branch, with Railway's **Wait for CI** disabled.
+The required pull-request CI check builds and smoke-tests the image before merge, then Railway builds
+and deploys the accepted commit. Configure Slack interactivity at
+`https://<host>/api/slack/interactivity` and set the target repository's `FEATURE_REC_API_URL` to
+`https://<host>`.
+
+Before the service becomes critical, verify Railway database backups and perform a test export and
+restore. The image and environment contract are not Railway-specific: migration to another provider
+consists of restoring Postgres, supplying the same variables, deploying the same image, verifying
+`/health`, and switching DNS.
+
 ## Commands
 
 | Command | Description |
@@ -156,6 +210,8 @@ target repository to start the review loop.
 | `make ci` | Run the complete local CI gate with Docker-managed Postgres. |
 | `pnpm feature-rec:service` | Start the local Feature-Rec backend on `PORT` or `3000`. |
 | `pnpm feature-rec:selftest` | Run self-tests for core, service, and action packages. |
+| `pnpm --filter @feature-rec/service run build` | Compile the production backend into `packages/service/dist`. |
+| `docker build -t feature-rec-service:local .` | Build the backend-only production image. |
 
 ## Validate
 
@@ -165,8 +221,8 @@ Run the complete project gate from the repository root:
 make ci
 ```
 
-This starts or reuses the Docker-managed Postgres instance, then runs the same application checks
-as GitHub Actions:
+This starts or reuses the Docker-managed Postgres instance, then runs the application checks used by
+GitHub Actions before its production-image smoke test:
 
 ```bash
 pnpm typecheck

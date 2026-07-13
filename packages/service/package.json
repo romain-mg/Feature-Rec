@@ -3,21 +3,28 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "files": [
+    "dist"
+  ],
   "scripts": {
+    "build": "tsup",
     "dev": "tsx src/index.ts",
+    "start": "node --enable-source-maps dist/index.js",
     "typecheck": "tsc --noEmit",
     "selftest": "tsx scripts/selftest.mts"
   },
   "dependencies": {
-    "@feature-rec/core": "workspace:*",
     "fastify": "^5.8.5",
     "kysely": "^0.29.3",
     "pg": "^8.22.0",
+    "yaml": "^2.9.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
-    "@types/node": "^22.10.0",
+    "@feature-rec/core": "workspace:*",
+    "@types/node": "^24.13.3",
     "@types/pg": "^8.20.0",
+    "tsup": "^8.5.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   }
