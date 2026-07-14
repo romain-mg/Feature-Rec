@@ -13,15 +13,13 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
 COPY packages/core/package.json packages/core/package.json
 COPY packages/service/package.json packages/service/package.json
 
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
-    pnpm install --frozen-lockfile --filter @feature-rec/service...
+RUN pnpm install --frozen-lockfile --filter @feature-rec/service...
 
 COPY packages/core packages/core
 COPY packages/service packages/service
 
 RUN pnpm --filter @feature-rec/service run build
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
-    pnpm --filter @feature-rec/service deploy --legacy --prod /app
+RUN pnpm --filter @feature-rec/service deploy --legacy --prod /app
 
 FROM node:24-bookworm-slim AS runtime
 
