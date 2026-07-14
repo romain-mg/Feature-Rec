@@ -10,9 +10,10 @@ export type CycleRecord = ReviewCycle & {
 export type StartCycleResult = {
   cycle: CycleRecord;
   superseded: CycleRecord[];
-  created: boolean;
-  attemptId: string | null;
-};
+} & (
+  | { created: true; attemptId: string }
+  | { created: false; attemptId: null }
+);
 
 export type CycleStore = {
   startCycle(input: RunStartRequest & { cycleKey: string }): Promise<StartCycleResult>;

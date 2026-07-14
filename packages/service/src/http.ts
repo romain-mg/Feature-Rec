@@ -190,7 +190,7 @@ export function buildServer(input: {
         cycleId: result.cycle.id,
         cycleKey,
         checkRunId: result.cycle.checkRunId,
-        attemptId: result.attemptId ?? undefined,
+        attemptId: result.attemptId,
       };
     }
 
@@ -201,14 +201,12 @@ export function buildServer(input: {
     try {
       checkRunId = await github.createCheckRun({ ...start, cycleKey });
     } catch (err) {
-      if (result.attemptId) {
-        await store.transitionRunnerStatus({
-          cycleId: result.cycle.id,
-          attemptId: result.attemptId,
-          from: ["analyzing"],
-          to: "failed",
-        });
-      }
+      await store.transitionRunnerStatus({
+        cycleId: result.cycle.id,
+        attemptId: result.attemptId,
+        from: ["analyzing"],
+        to: "failed",
+      });
       throw err;
     }
     const statusAfterAttach = await store.attachCheckRun(result.cycle.id, checkRunId);
@@ -245,7 +243,7 @@ export function buildServer(input: {
       cycleId: result.cycle.id,
       cycleKey,
       checkRunId,
-      attemptId: result.attemptId ?? undefined,
+      attemptId: result.attemptId,
     };
   });
 
