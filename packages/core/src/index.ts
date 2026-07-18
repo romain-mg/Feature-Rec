@@ -115,9 +115,6 @@ export function loadFeatureRecConfig(path: string): FeatureRecConfig {
   return parseFeatureRecConfig(fs.readFileSync(path, "utf8"));
 }
 
-// Fixed PR comment templates. Deliberately not configurable: fewer yaml knobs
-// keeps target-repo onboarding simple. Unknown legacy keys (acceptComment,
-// rejectComment) in existing configs are stripped by the schema, not rejected.
 export const GITHUB_ACCEPT_COMMENT = "@{pr_author} validation passed; you can merge.";
 export const GITHUB_REJECT_COMMENT = "{mention} make the following changes:\n\n{review_comment}";
 
