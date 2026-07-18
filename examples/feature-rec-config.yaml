@@ -1,9 +1,5 @@
 version: 1
 
-github:
-  checkName: Feature-Rec
-  mention: "@claude"
-
 slack:
   channel: "C0123456789"
   mention: "<!subteam^S0123456789|@product-team>"

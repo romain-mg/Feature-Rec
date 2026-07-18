@@ -1,6 +1,11 @@
 import crypto from "node:crypto";
 import type { RunStartRequest } from "@feature-rec/core";
-import { GITHUB_ACCEPT_COMMENT, GITHUB_REJECT_COMMENT, renderTemplate } from "@feature-rec/core";
+import {
+  GITHUB_ACCEPT_COMMENT,
+  GITHUB_CHECK_NAME,
+  GITHUB_REJECT_COMMENT,
+  renderTemplate,
+} from "@feature-rec/core";
 import type { ServiceEnv } from "./env";
 import { withRetry } from "./retry";
 import type { CycleRecord } from "./storage";
@@ -104,7 +109,7 @@ export class GitHubClient {
         token,
         method: "POST",
         body: {
-          name: input.checkName,
+          name: GITHUB_CHECK_NAME,
           head_sha: input.headSha,
           status: "in_progress",
           external_id: input.cycleKey,
@@ -160,7 +165,6 @@ export class GitHubClient {
     const commentUrl = await this.comment(
       cycle,
       renderTemplate(GITHUB_ACCEPT_COMMENT, {
-        mention: cycle.config.github.mention,
         pr_author: cycle.prAuthor,
       }).trim(),
     );
@@ -179,7 +183,6 @@ export class GitHubClient {
     const commentUrl = await this.comment(
       cycle,
       renderTemplate(GITHUB_REJECT_COMMENT, {
-        mention: cycle.config.github.mention,
         review_comment: reviewComment,
         pr_author: cycle.prAuthor,
       }).trim(),

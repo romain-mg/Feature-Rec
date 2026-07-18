@@ -5,10 +5,6 @@ import { z } from "zod";
 
 export const FeatureRecConfigSchema = z.object({
   version: z.literal(1),
-  github: z.object({
-    checkName: z.string().min(1).default("Feature-Rec"),
-    mention: z.string().default("@claude"),
-  }),
   slack: z.object({
     channel: z.string().min(1),
     mention: z.string().default(""),
@@ -45,7 +41,6 @@ export const RunStartRequestSchema = z.object({
   headSha: z.string().min(7),
   baseSha: z.string().min(7),
   configHash: z.string().min(8),
-  checkName: z.string().min(1).default("Feature-Rec"),
   config: FeatureRecConfigSchema,
 });
 export type RunStartRequest = z.infer<typeof RunStartRequestSchema>;
@@ -115,8 +110,9 @@ export function loadFeatureRecConfig(path: string): FeatureRecConfig {
   return parseFeatureRecConfig(fs.readFileSync(path, "utf8"));
 }
 
+export const GITHUB_CHECK_NAME = "Feature-Rec";
 export const GITHUB_ACCEPT_COMMENT = "@{pr_author} validation passed; you can merge.";
-export const GITHUB_REJECT_COMMENT = "{mention} make the following changes:\n\n{review_comment}";
+export const GITHUB_REJECT_COMMENT = "@{pr_author} make the following changes:\n\n{review_comment}";
 
 export function renderTemplate(template: string, values: Record<string, string>): string {
   return template.replace(/\{([a-zA-Z0-9_]+)\}/g, (_, key: string) => values[key] ?? "");

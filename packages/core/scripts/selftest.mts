@@ -13,17 +13,12 @@ import {
 
 const config = parseFeatureRecConfig(`
 version: 1
-github:
-  checkName: Feature-Rec
-  mention: "@claude"
 slack:
   channel: "C0123"
   mention: "<!subteam^S123|@reviewers>"
   approverUsergroups: ["S123"]
 `);
 
-assert.equal(config.github.checkName, "Feature-Rec");
-assert.equal(config.github.mention, "@claude");
 assert.equal(config.slack.approverUsergroups[0], "S123");
 assert.equal(
   renderTemplate(GITHUB_ACCEPT_COMMENT, { pr_author: "romain" }),
@@ -31,10 +26,10 @@ assert.equal(
 );
 assert.equal(
   renderTemplate(GITHUB_REJECT_COMMENT, {
-    mention: config.github.mention,
+    pr_author: "romain",
     review_comment: "make it feel premium",
   }),
-  "@claude make the following changes:\n\nmake it feel premium",
+  "@romain make the following changes:\n\nmake it feel premium",
 );
 assert.equal(
   buildCycleKey({
@@ -68,17 +63,14 @@ assert.equal(
   false,
 );
 
-// Legacy configs that still set the removed comment-template keys must keep
-// parsing: unknown keys are stripped rather than rejected.
+// Legacy configs that still set the removed github section must keep parsing:
+// unknown keys are stripped rather than rejected.
 const yamlConfig = parseFeatureRecConfig(`
 version: 1
 github:
-  checkName: Feature-Rec
+  checkName: legacy-section-now-ignored
   mention: "@claude"
   acceptComment: "legacy key, now ignored"
-  rejectComment: |
-    legacy key,
-    now ignored
 slack:
   channel: "C0123 # design-review"
   mention: ""
@@ -86,13 +78,12 @@ slack:
     - "S123"
 `);
 assert.equal(yamlConfig.slack.channel, "C0123 # design-review");
-assert.equal("acceptComment" in yamlConfig.github, false);
-assert.equal("rejectComment" in yamlConfig.github, false);
+assert.equal("github" in yamlConfig, false);
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const exampleConfig = parseFeatureRecConfig(
   fs.readFileSync(path.resolve(here, "../../../examples/feature-rec-config.yaml"), "utf8"),
 );
-assert.equal(exampleConfig.github.mention, "@claude");
+assert.equal(exampleConfig.slack.channel, "C0123456789");
 
 console.log("core selftest passed");

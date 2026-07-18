@@ -48,10 +48,11 @@ The repository is a pnpm monorepo with these main pieces:
 | `examples` | Example Feature-Rec config and GitHub Actions workflow for a target repository. |
 
 Feature-Rec is configured in the target repository with `.github/feature-rec-config.yaml`. The
-config chooses the GitHub check name, Slack channel, Slack product group, and approver usergroups.
-The PR comments posted after approval or rejection and the Slack button labels use fixed built-in
-text. See [`docs/feature-rec.md`](docs/feature-rec.md) for the full GitHub App, Slack App, and
-target repository setup.
+config chooses the Slack channel, Slack product group, and approver usergroups. Everything else is
+fixed: the `Feature-Rec` check name, the Slack button labels, and the PR comments posted after
+approval or rejection, which mention the PR author. See
+[`docs/feature-rec.md`](docs/feature-rec.md) for the full GitHub App, Slack App, and target
+repository setup.
 
 ## Install
 

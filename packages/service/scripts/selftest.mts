@@ -36,9 +36,6 @@ const testUrl = (() => {
 
 const config = parseFeatureRecConfig(`
 version: 1
-github:
-  checkName: Feature-Rec
-  mention: "@claude"
 slack:
   channel: "C0123"
   mention: ""
@@ -47,9 +44,6 @@ slack:
 
 const restrictedConfig = parseFeatureRecConfig(`
 version: 1
-github:
-  checkName: Feature-Rec
-  mention: "@claude"
 slack:
   channel: "C0123"
   mention: ""
@@ -163,7 +157,6 @@ function makeStart(prNumber: number, overrides: Partial<RunStartRequest> = {}): 
     headSha: "abc1234567",
     baseSha: "def1234567",
     configHash: "0123456789abcdef",
-    checkName: "Feature-Rec",
     config,
     ...overrides,
   };
@@ -316,7 +309,7 @@ try {
     assert.equal(githubCalls[0].url.endsWith("/repos/MathFreedom/Agora/issues/1/comments"), true);
     assert.equal(
       githubCalls[0].body.body,
-      "@claude make the following changes:\n\nmake it feel premium",
+      "@romain make the following changes:\n\nmake it feel premium",
     );
     assert.equal(githubCalls[1].url.endsWith("/repos/MathFreedom/Agora/check-runs/123"), true);
     assert.equal(

@@ -58,7 +58,6 @@ async function main(): Promise<void> {
     headSha: pr.head.sha,
     baseSha: pr.base.sha,
     configHash: cfgHash,
-    checkName: config.github.checkName,
     config,
   });
 
