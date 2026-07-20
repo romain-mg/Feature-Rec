@@ -18,13 +18,15 @@ import { GitHubClient } from "./github";
 import { withRetry } from "./retry";
 import { SlackClient, verifySlackSignature } from "./slack";
 import type { SlackUsergroup } from "./slack";
-import type { BotChannel, CycleStore } from "./storage";
+import type { BotChannel, CycleRecord, CycleStore } from "./storage";
 
 const VIDEO_BODY_LIMIT_BYTES = 500 * 1024 * 1024;
 
 type SlackPayload = {
   type: "block_actions" | "view_submission";
   trigger_id?: string;
+  response_url?: string;
+  team?: { id?: string };
   user?: { id?: string; username?: string; name?: string };
   actions?: Array<{ action_id?: string; action_ts?: string; value?: string }>;
   view?: {
@@ -430,7 +432,12 @@ export function buildServer(input: {
       );
 
       await slack.uploadVideo(cycle, resolved.channelId, video);
-      const message = await slack.postValidation(cycle, resolved.channelId, null);
+      const settings = await store.getChannelSettings(resolved.teamId, resolved.channelId);
+      const message = await slack.postValidation(
+        cycle,
+        resolved.channelId,
+        settings?.mention ?? null,
+      );
       const statusAfter = await store.attachSlackMessage(cycle.id, message.channel, message.ts);
       if (statusAfter === "superseded") {
         // Superseded after the transition but before the Slack post landed:
@@ -730,6 +737,34 @@ export function buildServer(input: {
     if (promoted) await slack.postMessage(promoted.channelId, SLACK_PROMOTION_NOTICE);
   }
 
+  // Approval authorization comes from the channel's settings at click time:
+  // no list means everyone in the channel may approve; otherwise expand the
+  // stored usergroups/users and answer unauthorized clicks ephemerally —
+  // never drop them silently.
+  async function approvalGate(
+    payload: SlackPayload,
+    cycle: CycleRecord,
+    responseUrl: string | undefined,
+  ): Promise<boolean> {
+    const teamId = payload.team?.id ?? (await slack.botIdentity()).teamId;
+    const settings = cycle.slackChannelId
+      ? await store.getChannelSettings(teamId, cycle.slackChannelId)
+      : null;
+    const approvers = settings?.approvers ?? null;
+    if (await slack.isApprover(approvers, payload.user?.id)) return true;
+    app.log.warn({ cycleId: cycle.id, slackUserId: payload.user?.id }, "unauthorized Slack approver");
+    if (responseUrl && approvers) {
+      // Best-effort: a modal can outlive its stashed response_url (30 min),
+      // and a dead URL must not turn the rejection into a handler error.
+      await slack
+        .respondEphemeral(responseUrl, `Only ${renderApproverIds(approvers)} can approve.`)
+        .catch((err: unknown) =>
+          app.log.warn({ err, cycleId: cycle.id }, "unauthorized-approver ephemeral reply failed"),
+        );
+    }
+    return false;
+  }
+
   async function handleBlockAction(payload: SlackPayload): Promise<void> {
     const action = payload.actions?.[0];
     const value = SlackApprovalPayloadSchema.parse(JSON.parse(action?.value ?? "{}"));
@@ -737,10 +772,7 @@ export function buildServer(input: {
 
     const cycle = await store.getCycle(value.cycleId);
     if (!cycle) return;
-    if (!(await slack.isApprover(null, payload.user?.id))) {
-      app.log.warn({ cycleId: cycle.id, slackUserId: payload.user?.id }, "unauthorized Slack approver");
-      return;
-    }
+    if (!(await approvalGate(payload, cycle, payload.response_url))) return;
     if (!(await store.recordProcessedInteraction(interactionId, value.cycleId))) return;
 
     if (value.action === "accept") {
@@ -765,20 +797,21 @@ export function buildServer(input: {
     }
 
     if (payload.trigger_id) {
-      await slack.openRequestChangesModal(payload.trigger_id, cycle, undefined);
+      await slack.openRequestChangesModal(payload.trigger_id, cycle, payload.response_url);
     }
   }
 
   async function handleViewSubmission(payload: SlackPayload, comment: string): Promise<void> {
-    const meta = JSON.parse(payload.view?.private_metadata ?? "{}") as { cycleId?: string; headSha?: string };
+    const meta = JSON.parse(payload.view?.private_metadata ?? "{}") as {
+      cycleId?: string;
+      headSha?: string;
+      responseUrl?: string;
+    };
     const cycleId = meta.cycleId ?? "";
     const interactionId = `view:${payload.view?.id ?? ""}:${payload.view?.hash ?? ""}`;
     const cycle = await store.getCycle(cycleId);
     if (!cycle) return;
-    if (!(await slack.isApprover(null, payload.user?.id))) {
-      app.log.warn({ cycleId: cycle.id, slackUserId: payload.user?.id }, "unauthorized Slack approver");
-      return;
-    }
+    if (!(await approvalGate(payload, cycle, meta.responseUrl))) return;
     if (!(await store.recordProcessedInteraction(interactionId, cycleId))) return;
 
     const rejected = await store.transitionSlackStatus({
