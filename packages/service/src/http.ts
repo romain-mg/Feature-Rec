@@ -3,15 +3,20 @@ import crypto from "node:crypto";
 import {
   buildCycleKey,
   ClassifierResultSchema,
+  renderTemplate,
   RunStartRequestSchema,
   SlackApprovalPayloadSchema,
+  SLACK_GREETING_ACTIVE,
+  SLACK_GREETING_NEXT_IN_LINE,
+  SLACK_GREETING_QUEUED,
+  SLACK_PROMOTION_NOTICE,
 } from "@feature-rec/core";
 import type { ServiceEnv } from "./env";
 import { ChannelResolutionError, resolveChannel } from "./channels";
 import { GitHubClient } from "./github";
 import { withRetry } from "./retry";
 import { SlackClient, verifySlackSignature } from "./slack";
-import type { CycleStore } from "./storage";
+import type { BotChannel, CycleStore } from "./storage";
 
 const VIDEO_BODY_LIMIT_BYTES = 500 * 1024 * 1024;
 
@@ -30,10 +35,38 @@ type SlackPayload = {
   };
 };
 
+type SlackEventEnvelope = {
+  type?: string;
+  challenge?: string;
+  team_id?: string;
+  enterprise_id?: string | null;
+  event?: {
+    type?: string;
+    user?: string;
+    channel?: string;
+    event_ts?: string;
+  };
+};
+
 function param(params: unknown, key: string): string {
   const value = (params as Record<string, unknown>)[key];
   if (typeof value !== "string" || !value) throw new Error(`Missing parameter ${key}`);
   return value;
+}
+
+function rawJsonBody(body: unknown): string {
+  if (body && typeof body === "object") {
+    const raw = (body as { __rawBody?: unknown }).__rawBody;
+    if (typeof raw === "string") return raw;
+  }
+  return "";
+}
+
+function slackTsToIso(ts: string | undefined): string {
+  const seconds = Number(ts);
+  return Number.isFinite(seconds) && seconds > 0
+    ? new Date(seconds * 1000).toISOString()
+    : new Date().toISOString();
 }
 
 function timingSafeStringEqual(left: string, right: string): boolean {
@@ -412,6 +445,76 @@ export function buildServer(input: {
 
     return reply.send("");
   });
+
+  app.post("/api/slack/events", async (request, reply) => {
+    const signatureOk = verifySlackSignature({
+      signingSecret: env.slackSigningSecret,
+      timestamp: request.headers["x-slack-request-timestamp"] as string | undefined,
+      signature: request.headers["x-slack-signature"] as string | undefined,
+      rawBody: rawJsonBody(request.body),
+    });
+    if (!signatureOk) return reply.code(401).send({ error: "invalid slack signature" });
+
+    const body = request.body as SlackEventEnvelope;
+    if (body.type === "url_verification") return reply.send({ challenge: body.challenge ?? "" });
+    if (body.type !== "event_callback") return reply.send({ ok: true });
+
+    // Drop everything that isn't a bot membership change, without logging it:
+    // membership events fire for every user entering a bot channel and their
+    // payloads must never reach the logs.
+    const event = body.event ?? {};
+    const isJoin = event.type === "member_joined_channel";
+    const isLeave = event.type === "member_left_channel";
+    if ((!isJoin && !isLeave) || !event.user || !event.channel) return reply.send({ ok: true });
+    const identity = await slack.botIdentity();
+    if (event.user !== identity.userId) return reply.send({ ok: true });
+
+    const teamId = body.team_id ?? identity.teamId;
+    const channelId = event.channel;
+    const eventAt = slackTsToIso(event.event_ts);
+
+    // The idempotent DB write lands before the 200, so a pre-ack crash rides
+    // Slack's retries; greetings and notices run detached so Slack API latency
+    // cannot consume the 3-second deadline.
+    if (isJoin) {
+      await store.recordChannelJoin({
+        teamId,
+        enterpriseId: body.enterprise_id ?? null,
+        channelId,
+        joinedAt: eventAt,
+      });
+      void greetJoinedChannel(teamId, channelId).catch((err) => app.log.error(err));
+      return reply.send({ ok: true });
+    }
+
+    const activeBefore = await store.activeBotChannels(teamId);
+    await store.recordChannelLeave({ teamId, channelId, leftAt: eventAt });
+    void notifyPromotion(teamId, channelId, activeBefore).catch((err) => app.log.error(err));
+    return reply.send({ ok: true });
+  });
+
+  async function greetJoinedChannel(teamId: string, channelId: string): Promise<void> {
+    const active = await store.activeBotChannels(teamId);
+    const rank = active.findIndex((channel) => channel.channelId === channelId) + 1;
+    if (rank === 0) return; // already left again; nothing to greet
+    const text =
+      rank === 1
+        ? SLACK_GREETING_ACTIVE
+        : renderTemplate(rank === 2 ? SLACK_GREETING_NEXT_IN_LINE : SLACK_GREETING_QUEUED, {
+            active_channel: `<#${active[0].channelId}>`,
+          });
+    await slack.postMessage(channelId, text);
+  }
+
+  async function notifyPromotion(
+    teamId: string,
+    leftChannelId: string,
+    activeBefore: BotChannel[],
+  ): Promise<void> {
+    if (activeBefore[0]?.channelId !== leftChannelId) return;
+    const promoted = (await store.activeBotChannels(teamId))[0];
+    if (promoted) await slack.postMessage(promoted.channelId, SLACK_PROMOTION_NOTICE);
+  }
 
   async function handleBlockAction(payload: SlackPayload): Promise<void> {
     const action = payload.actions?.[0];
