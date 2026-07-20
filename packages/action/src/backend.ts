@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import type { ClassifierResult, FeatureRecConfig, RunStartRequest } from "@feature-rec/core";
+import type { ClassifierResult, RunStartRequest } from "@feature-rec/core";
 import { RunStartResponseSchema } from "@feature-rec/core";
 
 function runnerToken(): string {
@@ -27,10 +27,7 @@ async function postJson<T>(apiUrl: string, path: string, body: unknown): Promise
   return (await response.json()) as T;
 }
 
-export async function startCycle(
-  apiUrl: string,
-  input: Omit<RunStartRequest, "config"> & { config: FeatureRecConfig },
-) {
+export async function startCycle(apiUrl: string, input: RunStartRequest) {
   return RunStartResponseSchema.parse(await postJson(apiUrl, "/api/runs/start", input));
 }
 

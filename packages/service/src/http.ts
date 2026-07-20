@@ -7,6 +7,7 @@ import {
   SlackApprovalPayloadSchema,
 } from "@feature-rec/core";
 import type { ServiceEnv } from "./env";
+import { ChannelResolutionError, resolveChannel } from "./channels";
 import { GitHubClient } from "./github";
 import { withRetry } from "./retry";
 import { SlackClient, verifySlackSignature } from "./slack";
@@ -320,6 +321,36 @@ export function buildServer(input: {
       });
       if (!cycle) return reply.send({ ok: false, stale: true });
 
+      // Resolve the review channel before any side effect: with no channel
+      // there is nowhere to post, so fail the cycle with an actionable
+      // check-run message. The runner's follow-up /failed call then no-ops on
+      // the status guard, preserving that message.
+      let resolved: { teamId: string; channelId: string };
+      try {
+        resolved = await resolveChannel(store, slack);
+      } catch (err) {
+        if (!(err instanceof ChannelResolutionError)) throw err;
+        const failed = await store.transitionRunnerStatus({
+          cycleId: cycle.id,
+          attemptId,
+          from: ["pending_validation"],
+          to: "failed",
+        });
+        // Superseded while resolving: the superseder already neutralized the
+        // check run — don't clobber its conclusion with a failure.
+        if (!failed) return reply.send({ ok: false, stale: true });
+        await withRetry(() =>
+          github.updateCheckRun(cycle, {
+            conclusion: "failure",
+            output: {
+              title: "Feature-Rec: no Slack review channel",
+              summary: err.message,
+            },
+          }),
+        );
+        return reply.code(422).send({ error: "no_slack_channel", message: err.message });
+      }
+
       await withRetry(() =>
         github.updateCheckRun(cycle, {
           status: "in_progress",
@@ -330,8 +361,8 @@ export function buildServer(input: {
         }),
       );
 
-      await slack.uploadVideo(cycle.config, cycle, video);
-      const message = await slack.postValidation(cycle.config, cycle);
+      await slack.uploadVideo(cycle, resolved.channelId, video);
+      const message = await slack.postValidation(cycle, resolved.channelId, null);
       const statusAfter = await store.attachSlackMessage(cycle.id, message.channel, message.ts);
       if (statusAfter === "superseded") {
         // Superseded after the transition but before the Slack post landed:
@@ -389,7 +420,7 @@ export function buildServer(input: {
 
     const cycle = await store.getCycle(value.cycleId);
     if (!cycle) return;
-    if (!(await slack.isApprover(cycle.config, payload.user?.id))) {
+    if (!(await slack.isApprover(null, payload.user?.id))) {
       app.log.warn({ cycleId: cycle.id, slackUserId: payload.user?.id }, "unauthorized Slack approver");
       return;
     }
@@ -417,7 +448,7 @@ export function buildServer(input: {
     }
 
     if (payload.trigger_id) {
-      await slack.openRequestChangesModal(payload.trigger_id, cycle);
+      await slack.openRequestChangesModal(payload.trigger_id, cycle, undefined);
     }
   }
 
@@ -427,7 +458,7 @@ export function buildServer(input: {
     const interactionId = `view:${payload.view?.id ?? ""}:${payload.view?.hash ?? ""}`;
     const cycle = await store.getCycle(cycleId);
     if (!cycle) return;
-    if (!(await slack.isApprover(cycle.config, payload.user?.id))) {
+    if (!(await slack.isApprover(null, payload.user?.id))) {
       app.log.warn({ cycleId: cycle.id, slackUserId: payload.user?.id }, "unauthorized Slack approver");
       return;
     }

@@ -1,25 +1,17 @@
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import {
   buildCycleKey,
   GITHUB_ACCEPT_COMMENT,
   GITHUB_REJECT_COMMENT,
   isAllowedPullRequestEvent,
-  parseFeatureRecConfig,
   renderTemplate,
+  SLACK_GREETING_ACTIVE,
+  SLACK_GREETING_NEXT_IN_LINE,
+  SLACK_GREETING_QUEUED,
+  SLACK_NO_CHANNEL_MESSAGE,
+  SLACK_PROMOTION_NOTICE,
 } from "../src/index";
 
-const config = parseFeatureRecConfig(`
-version: 1
-slack:
-  channel: "C0123"
-  mention: "<!subteam^S123|@reviewers>"
-  approverUsergroups: ["S123"]
-`);
-
-assert.equal(config.slack.approverUsergroups[0], "S123");
 assert.equal(
   renderTemplate(GITHUB_ACCEPT_COMMENT, { pr_author: "romain" }),
   "@romain validation passed; you can merge.",
@@ -37,9 +29,8 @@ assert.equal(
     repo: "r",
     prNumber: 7,
     headSha: "abc1234",
-    configHash: "cfg",
   }),
-  "o/r#7:abc1234:cfg",
+  "o/r#7:abc1234",
 );
 assert.equal(
   isAllowedPullRequestEvent({
@@ -63,27 +54,16 @@ assert.equal(
   false,
 );
 
-// Legacy configs that still set the removed github section must keep parsing:
-// unknown keys are stripped rather than rejected.
-const yamlConfig = parseFeatureRecConfig(`
-version: 1
-github:
-  checkName: legacy-section-now-ignored
-  mention: "@claude"
-  acceptComment: "legacy key, now ignored"
-slack:
-  channel: "C0123 # design-review"
-  mention: ""
-  approverUsergroups:
-    - "S123"
-`);
-assert.equal(yamlConfig.slack.channel, "C0123 # design-review");
-assert.equal("github" in yamlConfig, false);
-
-const here = path.dirname(fileURLToPath(import.meta.url));
-const exampleConfig = parseFeatureRecConfig(
-  fs.readFileSync(path.resolve(here, "../../../examples/feature-rec-config.yaml"), "utf8"),
+assert.equal(SLACK_GREETING_ACTIVE.includes("{"), false);
+assert.equal(SLACK_PROMOTION_NOTICE.includes("{"), false);
+assert.equal(SLACK_NO_CHANNEL_MESSAGE.includes("{"), false);
+assert.equal(
+  renderTemplate(SLACK_GREETING_NEXT_IN_LINE, { active_channel: "<#C0123>" }),
+  "Connected, validations currently go to <#C0123>. Remove me from that channel if you want reviews to happen here instead.",
 );
-assert.equal(exampleConfig.slack.channel, "C0123456789");
+assert.equal(
+  renderTemplate(SLACK_GREETING_QUEUED, { active_channel: "<#C0123>" }),
+  "Connected but currently unused, validations go to <#C0123>. Remove me from other channels to use this one.",
+);
 
 console.log("core selftest passed");

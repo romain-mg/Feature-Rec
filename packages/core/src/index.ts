@@ -1,17 +1,4 @@
-import crypto from "node:crypto";
-import fs from "node:fs";
-import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-
-export const FeatureRecConfigSchema = z.object({
-  version: z.literal(1),
-  slack: z.object({
-    channel: z.string().min(1),
-    mention: z.string().default(""),
-    approverUsergroups: z.array(z.string()).default([]),
-  }),
-});
-export type FeatureRecConfig = z.infer<typeof FeatureRecConfigSchema>;
 
 export const ClassifierResultSchema = z.object({
   frontendVisible: z.boolean(),
@@ -40,8 +27,6 @@ export const RunStartRequestSchema = z.object({
   prAuthor: z.string().default(""),
   headSha: z.string().min(7),
   baseSha: z.string().min(7),
-  configHash: z.string().min(8),
-  config: FeatureRecConfigSchema,
 });
 export type RunStartRequest = z.infer<typeof RunStartRequestSchema>;
 
@@ -68,7 +53,6 @@ export const ReviewCycleSchema = z.object({
   repo: z.string(),
   prNumber: z.number().int().positive(),
   headSha: z.string(),
-  configHash: z.string(),
   status: ReviewCycleStatusSchema,
   checkRunId: z.number().int().positive().nullable(),
   slackChannelId: z.string().nullable(),
@@ -83,13 +67,8 @@ export function buildCycleKey(input: {
   repo: string;
   prNumber: number;
   headSha: string;
-  configHash: string;
 }): string {
-  return `${input.owner}/${input.repo}#${input.prNumber}:${input.headSha}:${input.configHash}`;
-}
-
-export function configHash(config: FeatureRecConfig): string {
-  return crypto.createHash("sha256").update(JSON.stringify(config)).digest("hex").slice(0, 16);
+  return `${input.owner}/${input.repo}#${input.prNumber}:${input.headSha}`;
 }
 
 export function isAllowedPullRequestEvent(event: {
@@ -102,17 +81,20 @@ export function isAllowedPullRequestEvent(event: {
   return action === "opened" || action === "ready_for_review" || action === "synchronize";
 }
 
-export function parseFeatureRecConfig(source: string): FeatureRecConfig {
-  return FeatureRecConfigSchema.parse(parseYaml(source) ?? {});
-}
-
-export function loadFeatureRecConfig(path: string): FeatureRecConfig {
-  return parseFeatureRecConfig(fs.readFileSync(path, "utf8"));
-}
-
 export const GITHUB_CHECK_NAME = "Feature-Rec";
 export const GITHUB_ACCEPT_COMMENT = "@{pr_author} validation passed; you can merge.";
 export const GITHUB_REJECT_COMMENT = "@{pr_author} make the following changes:\n\n{review_comment}";
+
+export const SLACK_GREETING_ACTIVE =
+  "Connected, validation requests will appear in this channel.";
+export const SLACK_GREETING_NEXT_IN_LINE =
+  "Connected, validations currently go to {active_channel}. Remove me from that channel if you want reviews to happen here instead.";
+export const SLACK_GREETING_QUEUED =
+  "Connected but currently unused, validations go to {active_channel}. Remove me from other channels to use this one.";
+export const SLACK_PROMOTION_NOTICE =
+  "This channel now receives Feature-Rec validation requests.";
+export const SLACK_NO_CHANNEL_MESSAGE =
+  "Invite @Feature-Rec to your Slack review channel, then re-run.";
 
 export function renderTemplate(template: string, values: Record<string, string>): string {
   return template.replace(/\{([a-zA-Z0-9_]+)\}/g, (_, key: string) => values[key] ?? "");

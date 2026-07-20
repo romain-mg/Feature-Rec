@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
-import { configHash, isAllowedPullRequestEvent, loadFeatureRecConfig } from "@feature-rec/core";
+import { isAllowedPullRequestEvent } from "@feature-rec/core";
 import { renderFeatureRecVideo } from "@autodemo/cli/feature-rec";
 import { acceptCycle, failCycle, startCycle, uploadVideo } from "./backend";
 import { classifyFrontendVisible } from "./classifier";
@@ -32,13 +32,11 @@ function arg(name: string, fallback = ""): string {
 
 async function main(): Promise<void> {
   const repoRoot = path.resolve(arg("--repo", process.cwd()));
-  const configPath = path.resolve(arg("--config", path.join(repoRoot, ".github/feature-rec-config.yaml")));
   const eventPath = path.resolve(arg("--event", process.env.GITHUB_EVENT_PATH ?? ""));
   const apiUrl = arg("--api-url", process.env.FEATURE_REC_API_URL ?? "").replace(/\/$/, "");
   if (!apiUrl) throw new Error("Missing Feature-Rec api-url.");
   if (!eventPath || !fs.existsSync(eventPath)) throw new Error("Missing GITHUB_EVENT_PATH.");
 
-  const config = loadFeatureRecConfig(configPath);
   const event = JSON.parse(fs.readFileSync(eventPath, "utf8")) as PullRequestEvent;
   if (!isAllowedPullRequestEvent(event)) {
     console.log("Feature-Rec skipped: PR event is not an open ready review event.");
@@ -48,7 +46,6 @@ async function main(): Promise<void> {
   const owner = event.repository.owner.login;
   const repo = event.repository.name;
   const pr = event.pull_request;
-  const cfgHash = configHash(config);
   const started = await startCycle(apiUrl, {
     owner,
     repo,
@@ -57,8 +54,6 @@ async function main(): Promise<void> {
     prAuthor: pr.user.login,
     headSha: pr.head.sha,
     baseSha: pr.base.sha,
-    configHash: cfgHash,
-    config,
   });
 
   // Same-head duplicate: another runner already owns this cycle. Exit cleanly

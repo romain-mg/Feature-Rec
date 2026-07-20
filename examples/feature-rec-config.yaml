@@ -1,6 +1,0 @@
-version: 1
-
-slack:
-  channel: "C0123456789"
-  mention: "<!subteam^S0123456789|@product-team>"
-  approverUsergroups: ["S0123456789"]

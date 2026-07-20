@@ -1,11 +1,7 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { Client } from "pg";
-import {
-  buildCycleKey,
-  parseFeatureRecConfig,
-  type RunStartRequest,
-} from "@feature-rec/core";
+import { buildCycleKey, type RunStartRequest } from "@feature-rec/core";
 import { GitHubClient } from "../src/github";
 import type { ServiceEnv } from "../src/env";
 import { buildServer } from "../src/http";
@@ -33,22 +29,6 @@ const testUrl = (() => {
   url.pathname = `/${dbName}`;
   return url.toString();
 })();
-
-const config = parseFeatureRecConfig(`
-version: 1
-slack:
-  channel: "C0123"
-  mention: ""
-  approverUsergroups: []
-`);
-
-const restrictedConfig = parseFeatureRecConfig(`
-version: 1
-slack:
-  channel: "C0123"
-  mention: ""
-  approverUsergroups: ["S123"]
-`);
 
 const env: ServiceEnv = {
   port: 0,
@@ -123,6 +103,8 @@ function makeSlackStub() {
     postValidationCalls: 0,
     isApproverCalls: 0,
     finalizeCalls,
+    botIdentity: async () => ({ userId: "UBOT", teamId: "T0123", enterpriseId: null }),
+    listBotChannels: async (): Promise<string[]> => ["C0123"],
     uploadVideo: async (): Promise<void> => {
       stub.uploadVideoCalls += 1;
     },
@@ -156,8 +138,6 @@ function makeStart(prNumber: number, overrides: Partial<RunStartRequest> = {}): 
     prAuthor: "romain",
     headSha: "abc1234567",
     baseSha: "def1234567",
-    configHash: "0123456789abcdef",
-    config,
     ...overrides,
   };
 }
@@ -263,7 +243,6 @@ try {
 
     assert.equal(first.created, true);
     assert.ok(first.attemptId);
-    assert.equal(first.cycle.config.slack.channel, "C0123");
     assert.equal(second.created, false);
     assert.equal(second.attemptId, null);
     assert.equal(first.cycle.id, second.cycle.id);
@@ -616,7 +595,7 @@ try {
       return false;
     };
     const app = makeApp(github, slack);
-    const start = makeStart(10, { headSha: "approver01", config: restrictedConfig });
+    const start = makeStart(10, { headSha: "approver01" });
     const created = await store.startCycle({ ...start, cycleKey: buildCycleKey(start) });
     assert.ok(created.attemptId);
     await store.transitionRunnerStatus({

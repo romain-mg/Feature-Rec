@@ -1,9 +1,20 @@
 import crypto from "node:crypto";
-import type { FeatureRecConfig, SlackApprovalPayload } from "@feature-rec/core";
+import type { SlackApprovalPayload } from "@feature-rec/core";
 import type { ServiceEnv } from "./env";
 import type { CycleRecord } from "./storage";
 
 type SlackResponse<T> = T & { ok: boolean; error?: string };
+
+export type BotIdentity = {
+  userId: string;
+  teamId: string;
+  enterpriseId: string | null;
+};
+
+export type SlackUsergroup = {
+  id: string;
+  handle: string;
+};
 
 function timingSafeStringEqual(left: string, right: string): boolean {
   const leftBytes = Buffer.from(left);
@@ -55,14 +66,15 @@ function actionValue(payload: SlackApprovalPayload): string {
   return JSON.stringify(payload);
 }
 
-function validationBlocks(config: FeatureRecConfig, cycle: CycleRecord): unknown[] {
+function validationBlocks(cycle: CycleRecord, mention: string | null): unknown[] {
   const title = `Feature-Rec validation needed for ${cycle.owner}/${cycle.repo}#${cycle.prNumber}`;
+  const prefix = mention ?? "<!here>";
   return [
     {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: `${config.slack.mention ? `${config.slack.mention}\n` : ""}*${title}*\n${cycle.prTitle || "Frontend-visible change detected."}`,
+        text: `${prefix ? `${prefix}\n` : ""}*${title}*\n${cycle.prTitle || "Frontend-visible change detected."}`,
       },
     },
     {
@@ -100,14 +112,93 @@ function validationBlocks(config: FeatureRecConfig, cycle: CycleRecord): unknown
   ];
 }
 
+type ConversationsPage = {
+  channels?: Array<{
+    id: string;
+    is_ext_shared?: boolean;
+    is_pending_ext_shared?: boolean;
+  }>;
+  response_metadata?: { next_cursor?: string };
+};
+
 export class SlackClient {
   #env: ServiceEnv;
+  #identity: Promise<BotIdentity> | null = null;
 
   constructor(env: ServiceEnv) {
     this.#env = env;
   }
 
-  async uploadVideo(config: FeatureRecConfig, cycle: CycleRecord, file: Buffer): Promise<void> {
+  // Cached for the process lifetime: the bot token's identity never changes
+  // while the token is valid. Failures clear the cache so the next call retries.
+  botIdentity(): Promise<BotIdentity> {
+    this.#identity ??= slackApi<{
+      user_id: string;
+      team_id: string;
+      enterprise_id?: string | null;
+    }>(this.#env, "auth.test", {}).then(
+      (res) => ({
+        userId: res.user_id,
+        teamId: res.team_id,
+        enterpriseId: res.enterprise_id ?? null,
+      }),
+      (err: unknown) => {
+        this.#identity = null;
+        throw err;
+      },
+    );
+    return this.#identity;
+  }
+
+  // Channels the bot is a member of, excluding externally shared or pending
+  // Slack Connect channels: they must not leak PR titles or videos outside
+  // the organization.
+  async listBotChannels(): Promise<string[]> {
+    const channelIds: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await slackApi<ConversationsPage>(this.#env, "users.conversations", {
+        types: "public_channel,private_channel",
+        exclude_archived: true,
+        limit: 200,
+        ...(cursor ? { cursor } : {}),
+      });
+      for (const channel of page.channels ?? []) {
+        if (channel.is_ext_shared || channel.is_pending_ext_shared) continue;
+        channelIds.push(channel.id);
+      }
+      cursor = page.response_metadata?.next_cursor || undefined;
+    } while (cursor);
+    return channelIds;
+  }
+
+  async listUsergroups(): Promise<SlackUsergroup[]> {
+    const res = await slackApi<{ usergroups?: Array<{ id: string; handle: string }> }>(
+      this.#env,
+      "usergroups.list",
+      { include_disabled: false },
+    );
+    return (res.usergroups ?? []).map((group) => ({ id: group.id, handle: group.handle }));
+  }
+
+  async postMessage(channelId: string, text: string): Promise<void> {
+    await slackApi(this.#env, "chat.postMessage", { channel: channelId, text });
+  }
+
+  // response_url replies bypass the Web API: they are short-lived webhook URLs
+  // scoped to the triggering interaction.
+  async respondEphemeral(responseUrl: string, text: string): Promise<void> {
+    const response = await fetch(responseUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ response_type: "ephemeral", replace_original: false, text }),
+    });
+    if (!response.ok) {
+      throw new Error(`Slack response_url reply failed: ${response.status} ${await response.text()}`);
+    }
+  }
+
+  async uploadVideo(cycle: CycleRecord, channelId: string, file: Buffer): Promise<void> {
     if (!this.#env.slackBotToken) throw new Error("SLACK_BOT_TOKEN is not set.");
     const params = new URLSearchParams({
       filename: `feature-rec-${cycle.prNumber}-${cycle.headSha.slice(0, 8)}.mp4`,
@@ -131,25 +222,33 @@ export class SlackClient {
 
     await slackApi(this.#env, "files.completeUploadExternal", {
       files: [{ id: upload.file_id, title: `Feature-Rec PR #${cycle.prNumber}` }],
-      channel_id: config.slack.channel,
+      channel_id: channelId,
       initial_comment: `Feature-Rec video for ${cycle.owner}/${cycle.repo}#${cycle.prNumber}`,
     });
   }
 
-  async postValidation(config: FeatureRecConfig, cycle: CycleRecord): Promise<{ channel: string; ts: string }> {
+  async postValidation(
+    cycle: CycleRecord,
+    channelId: string,
+    mention: string | null,
+  ): Promise<{ channel: string; ts: string }> {
     const message = await slackApi<{ channel: string; ts: string }>(this.#env, "chat.postMessage", {
-      channel: config.slack.channel,
+      channel: channelId,
       text: `Feature-Rec validation needed for ${cycle.owner}/${cycle.repo}#${cycle.prNumber}`,
-      blocks: validationBlocks(config, cycle),
+      blocks: validationBlocks(cycle, mention),
     });
     return { channel: message.channel, ts: message.ts };
   }
 
-  async isApprover(config: FeatureRecConfig, userId: string | undefined): Promise<boolean> {
-    const usergroups = config.slack.approverUsergroups;
-    if (usergroups.length === 0) return true;
+  // approvers: S…/U… ids from channel settings; null or empty means everyone
+  // in the channel may approve.
+  async isApprover(approvers: string[] | null, userId: string | undefined): Promise<boolean> {
+    if (!approvers || approvers.length === 0) return true;
     if (!userId) return false;
+    if (approvers.includes(userId)) return true;
 
+    const usergroups = approvers.filter((id) => /^S[A-Z0-9]+$/.test(id));
+    if (usergroups.length === 0) return false;
     const memberships = await Promise.all(
       usergroups.map((usergroup) =>
         slackApi<{ users: string[] }>(this.#env, "usergroups.users.list", {
@@ -187,13 +286,23 @@ export class SlackClient {
     });
   }
 
-  async openRequestChangesModal(triggerId: string, cycle: CycleRecord): Promise<void> {
+  async openRequestChangesModal(
+    triggerId: string,
+    cycle: CycleRecord,
+    responseUrl: string | undefined,
+  ): Promise<void> {
     await slackApi(this.#env, "views.open", {
       trigger_id: triggerId,
       view: {
         type: "modal",
         callback_id: "feature_rec_request_changes_modal",
-        private_metadata: JSON.stringify({ cycleId: cycle.id, headSha: cycle.headSha }),
+        // responseUrl rides along so the submission handler can still reply
+        // ephemerally (view_submission payloads carry no response_url).
+        private_metadata: JSON.stringify({
+          cycleId: cycle.id,
+          headSha: cycle.headSha,
+          responseUrl,
+        }),
         title: { type: "plain_text", text: "Needs changes" },
         submit: { type: "plain_text", text: "Submit" },
         close: { type: "plain_text", text: "Cancel" },
