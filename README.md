@@ -40,19 +40,26 @@ The repository is a pnpm monorepo with these main pieces:
 | --- | --- |
 | `packages/action` | GitHub Action entrypoint. It reads the PR event, classifies the diff, invokes the video renderer when needed, and calls the backend. |
 | `packages/service` | Fastify backend for Slack uploads, Slack button handling, GitHub Check Runs, PR comments, and Postgres-backed review state. |
-| `packages/core` | Shared schemas, config parsing, template helpers, and action/service contracts. |
+| `packages/core` | Shared schemas, user-facing copy constants, template helpers, and action/service contracts. |
 | `packages/cli` | Renderer CLI: analyze a UI change, generate or reuse a Remotion scene, render video, and write release artifacts. |
 | `packages/video` | Remotion project used to render the generated scenes. |
 | `fixtures` | Example before/after UI changes that can render locally without external setup. |
 | `apps/web` | Small Next.js sample app whose UI code is used by the fixtures. It is not part of the pnpm workspace. |
-| `examples` | Example Feature-Rec config and GitHub Actions workflow for a target repository. |
+| `examples` | Example GitHub Actions workflow for a target repository. |
 
-Feature-Rec is configured in the target repository with `.github/feature-rec-config.yaml`. The
-config chooses the Slack channel, Slack product group, and approver usergroups. Everything else is
-fixed: the `Feature-Rec` check name, the Slack button labels, and the PR comments posted after
-approval or rejection, which mention the PR author. See
-[`docs/feature-rec.md`](docs/feature-rec.md) for the full GitHub App, Slack App, and target
-repository setup.
+Onboarding a repository takes three actions, with no configuration file:
+
+1. Install the Feature-Rec GitHub App on the repo.
+2. Add the workflow file (`examples/feature-rec-workflow.yaml`) with its `FEATURE_REC_API_URL`
+   variable and `FEATURE_REC_RUNNER_TOKEN`/`ANTHROPIC_API_KEY` secrets.
+3. Invite `@Feature-Rec` to the Slack review channel.
+
+Validations for every repo in a workspace go to the channel where the bot was first introduced;
+removing the bot from that channel promotes the next oldest. Mentions and approver restrictions
+are set per channel with `/feature-rec` slash commands. Everything else is fixed: the
+`Feature-Rec` check name, the Slack button labels, and the PR comments posted after approval or
+rejection, which mention the PR author. See [`docs/feature-rec.md`](docs/feature-rec.md) for the
+full GitHub App, Slack App, and target repository setup.
 
 ## Install
 
@@ -124,21 +131,22 @@ FEATURE_REC_RUNNER_TOKEN=<same shared secret as the backend>
 ANTHROPIC_API_KEY=<optional, but needed for live AI scene generation>
 ```
 
-Copy the example files into the target repository:
+Copy the example workflow into the target repository:
 
 ```text
-examples/feature-rec-config.yaml -> .github/feature-rec-config.yaml
 examples/feature-rec-workflow.yaml -> .github/workflows/feature-rec.yaml
 ```
 
-Configure the Slack app interactivity URL:
+Configure the Slack app URLs:
 
 ```text
-https://<public-tunnel-host>/api/slack/interactivity
+Interactivity:  https://<public-tunnel-host>/api/slack/interactivity
+Events:         https://<public-tunnel-host>/api/slack/events
+Slash command:  https://<public-tunnel-host>/api/slack/commands
 ```
 
-Then require the `Feature-Rec` Check Run in branch protection. Open or update a ready PR in the
-target repository to start the review loop.
+Invite `@Feature-Rec` to the Slack review channel, then require the `Feature-Rec` Check Run in
+branch protection. Open or update a ready PR in the target repository to start the review loop.
 
 ## Build the Backend Image
 
@@ -185,9 +193,9 @@ durable state belongs in Postgres.
 
 Enable GitHub Autodeploys for the protected `main` branch, with Railway's **Wait for CI** disabled.
 The required pull-request CI check builds and smoke-tests the image before merge, then Railway builds
-and deploys the accepted commit. Configure Slack interactivity at
-`https://<host>/api/slack/interactivity` and set the target repository's `FEATURE_REC_API_URL` to
-`https://<host>`.
+and deploys the accepted commit. Configure the Slack app's interactivity, events, and slash-command
+URLs at `https://<host>/api/slack/interactivity`, `…/api/slack/events`, and `…/api/slack/commands`,
+and set the target repository's `FEATURE_REC_API_URL` to `https://<host>`.
 
 Before the service becomes critical, verify Railway database backups and perform a test export and
 restore. The image and environment contract are not Railway-specific: migration to another provider
