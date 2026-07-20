@@ -9,13 +9,15 @@ import {
   SLACK_GREETING_ACTIVE,
   SLACK_GREETING_NEXT_IN_LINE,
   SLACK_GREETING_QUEUED,
+  SLACK_NO_CHANNEL_MESSAGE,
   SLACK_PROMOTION_NOTICE,
 } from "@feature-rec/core";
 import type { ServiceEnv } from "./env";
-import { ChannelResolutionError, resolveChannel } from "./channels";
+import { ChannelResolutionError, resolveChannel, syncTenantChannels } from "./channels";
 import { GitHubClient } from "./github";
 import { withRetry } from "./retry";
 import { SlackClient, verifySlackSignature } from "./slack";
+import type { SlackUsergroup } from "./slack";
 import type { BotChannel, CycleStore } from "./storage";
 
 const VIDEO_BODY_LIMIT_BYTES = 500 * 1024 * 1024;
@@ -52,6 +54,39 @@ function param(params: unknown, key: string): string {
   const value = (params as Record<string, unknown>)[key];
   if (typeof value !== "string" || !value) throw new Error(`Missing parameter ${key}`);
   return value;
+}
+
+// Slash-command target syntax. With "Escape channels, users, and links"
+// enabled on the command, user mentions arrive as <@U…|name>; usergroups and
+// @here/@channel arrive as typed.
+const USER_MENTION_RE = /^<@([UW][A-Z0-9]+)(?:\|[^>]*)?>$/;
+const SUBTEAM_MENTION_RE = /^<!subteam\^(S[A-Z0-9]+)(?:\|[^>]*)?>$/;
+
+// A user-correctable command mistake: the message goes back ephemerally
+// instead of becoming a 500.
+class CommandError extends Error {}
+
+const COMMAND_USAGE = [
+  "Usage:",
+  "`/feature-rec mention @here|@channel|@usergroup|@user…|off` — who validation requests mention; no target shows the current value",
+  "`/feature-rec approvers @usergroup|@user…|everyone` — restrict who can approve; no argument shows the current value",
+  "`/feature-rec status` — show routing, mention, and approvers",
+].join("\n");
+
+function describeMention(mention: string | null): string {
+  if (mention === null) return "@here (default)";
+  if (mention === "") return "off";
+  return mention;
+}
+
+function renderApproverIds(ids: string[]): string {
+  return ids.map((id) => (id.startsWith("S") ? `<!subteam^${id}>` : `<@${id}>`)).join(", ");
+}
+
+function describeApprovers(approvers: string[] | null): string {
+  return approvers && approvers.length > 0
+    ? `Approvers: ${renderApproverIds(approvers)}`
+    : "Approvers: everyone in the channel.";
 }
 
 function rawJsonBody(body: unknown): string {
@@ -492,6 +527,185 @@ export function buildServer(input: {
     void notifyPromotion(teamId, channelId, activeBefore).catch((err) => app.log.error(err));
     return reply.send({ ok: true });
   });
+
+  app.post("/api/slack/commands", async (request, reply) => {
+    const rawBody = String(request.body ?? "");
+    const signatureOk = verifySlackSignature({
+      signingSecret: env.slackSigningSecret,
+      timestamp: request.headers["x-slack-request-timestamp"] as string | undefined,
+      signature: request.headers["x-slack-signature"] as string | undefined,
+      rawBody,
+    });
+    if (!signatureOk) return reply.code(401).send({ error: "invalid slack signature" });
+
+    const form = new URLSearchParams(rawBody);
+    const teamId = form.get("team_id") ?? "";
+    const channelId = form.get("channel_id") ?? "";
+    const userId = form.get("user_id") ?? "";
+    if (!teamId || !channelId || !userId) {
+      return reply.code(400).send({ error: "malformed command payload" });
+    }
+
+    const ephemeral = (text: string) => reply.send({ response_type: "ephemeral", text });
+    const [subcommand, ...args] = (form.get("text") ?? "").trim().split(/\s+/).filter(Boolean);
+    try {
+      if (subcommand === "mention") {
+        return ephemeral(await mentionCommand({ teamId, channelId, userId, args }));
+      }
+      if (subcommand === "approvers") {
+        return ephemeral(await approversCommand({ teamId, channelId, userId, args }));
+      }
+      if (subcommand === "status") {
+        return ephemeral(await statusCommand(teamId, channelId));
+      }
+      return ephemeral(COMMAND_USAGE);
+    } catch (err) {
+      if (err instanceof CommandError) return ephemeral(err.message);
+      throw err;
+    }
+  });
+
+  async function mentionCommand(input: {
+    teamId: string;
+    channelId: string;
+    userId: string;
+    args: string[];
+  }): Promise<string> {
+    if (input.args.length === 0) {
+      const settings = await store.getChannelSettings(input.teamId, input.channelId);
+      return `Mention: ${describeMention(settings?.mention ?? null)}`;
+    }
+    if (input.args.includes("off")) {
+      if (input.args.length > 1) {
+        throw new CommandError('Use "off" by itself: `/feature-rec mention off`.');
+      }
+      await store.setMention({
+        teamId: input.teamId,
+        channelId: input.channelId,
+        mention: "",
+        updatedBy: input.userId,
+      });
+      return "Mention turned off for validation requests in this channel.";
+    }
+    const mention = (await resolveMentionTargets(input.args)).join(" ");
+    await store.setMention({
+      teamId: input.teamId,
+      channelId: input.channelId,
+      mention,
+      updatedBy: input.userId,
+    });
+    return `Validation requests in this channel will mention ${mention}.`;
+  }
+
+  async function resolveMentionTargets(tokens: string[]): Promise<string[]> {
+    const rendered: string[] = [];
+    let usergroups: SlackUsergroup[] | null = null;
+    for (const token of tokens) {
+      if (token === "@here" || token === "<!here>") {
+        rendered.push("<!here>");
+        continue;
+      }
+      if (token === "@channel" || token === "<!channel>") {
+        rendered.push("<!channel>");
+        continue;
+      }
+      const user = USER_MENTION_RE.exec(token);
+      if (user) {
+        rendered.push(`<@${user[1]}>`);
+        continue;
+      }
+      if (SUBTEAM_MENTION_RE.test(token)) {
+        rendered.push(token);
+        continue;
+      }
+      usergroups ??= await slack.listUsergroups();
+      const handle = token.replace(/^@/, "");
+      const group = usergroups.find((candidate) => candidate.handle === handle);
+      if (!group) {
+        throw new CommandError(
+          `Unknown mention target ${token}. Use @here, @channel, a usergroup handle, user mentions, or "off".`,
+        );
+      }
+      rendered.push(`<!subteam^${group.id}|@${group.handle}>`);
+    }
+    return rendered;
+  }
+
+  async function approversCommand(input: {
+    teamId: string;
+    channelId: string;
+    userId: string;
+    args: string[];
+  }): Promise<string> {
+    if (input.args.length === 0) {
+      const settings = await store.getChannelSettings(input.teamId, input.channelId);
+      return describeApprovers(settings?.approvers ?? null);
+    }
+    if (input.args.includes("everyone") || input.args.includes("off")) {
+      if (input.args.length > 1) {
+        throw new CommandError('Use "everyone" by itself: `/feature-rec approvers everyone`.');
+      }
+      await store.setApprovers({
+        teamId: input.teamId,
+        channelId: input.channelId,
+        approvers: null,
+        updatedBy: input.userId,
+      });
+      return "Everyone in the channel can now approve.";
+    }
+    const ids = await resolveApproverTargets(input.args);
+    await store.setApprovers({
+      teamId: input.teamId,
+      channelId: input.channelId,
+      approvers: ids,
+      updatedBy: input.userId,
+    });
+    return `Only ${renderApproverIds(ids)} can approve.`;
+  }
+
+  async function resolveApproverTargets(tokens: string[]): Promise<string[]> {
+    const ids = new Set<string>();
+    let usergroups: SlackUsergroup[] | null = null;
+    for (const token of tokens) {
+      const user = USER_MENTION_RE.exec(token);
+      if (user) {
+        ids.add(user[1]);
+        continue;
+      }
+      const subteam = SUBTEAM_MENTION_RE.exec(token);
+      if (subteam) {
+        ids.add(subteam[1]);
+        continue;
+      }
+      usergroups ??= await slack.listUsergroups();
+      const handle = token.replace(/^@/, "");
+      const group = usergroups.find((candidate) => candidate.handle === handle);
+      if (!group) {
+        throw new CommandError(
+          `Unknown approver ${token}. Use usergroup handles, user mentions, or "everyone".`,
+        );
+      }
+      ids.add(group.id);
+    }
+    return [...ids];
+  }
+
+  async function statusCommand(teamId: string, channelId: string): Promise<string> {
+    const tenant = await syncTenantChannels(store, slack);
+    const active = tenant.channels[0];
+    if (!active) return SLACK_NO_CHANNEL_MESSAGE;
+    const settings = await store.getChannelSettings(teamId, channelId);
+    const lines = [
+      `Validations go to <#${active.channelId}>.`,
+      `Mention: ${describeMention(settings?.mention ?? null)}`,
+      describeApprovers(settings?.approvers ?? null),
+    ];
+    const queue = tenant.channels.slice(1);
+    if (queue.length > 0) {
+      lines.push(`Fallback queue: ${queue.map((channel) => `<#${channel.channelId}>`).join(", ")}.`);
+    }
+    return lines.join("\n");
+  }
 
   async function greetJoinedChannel(teamId: string, channelId: string): Promise<void> {
     const active = await store.activeBotChannels(teamId);
