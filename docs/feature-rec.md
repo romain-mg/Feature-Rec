@@ -179,12 +179,14 @@ For quick local testing, `FEATURE_REC_GITHUB_TOKEN` can be used as a fallback, b
 
 Create a Slack App with bot scopes:
 
-- `chat:write`
-- `files:write`
-- `views:write`
-- `usergroups:read`
-- `channels:read`
-- `groups:read`
+- `chat:write` — post validation messages, greetings, and notices
+- `files:write` — upload the demo video
+- `views:write` — open the request-changes modal
+- `usergroups:read` — resolve usergroup handles and expand approver groups
+- `channels:read` — list the bot's public-channel memberships (routing)
+- `groups:read` — same for private channels
+- `commands` — added automatically with the `/feature-rec` slash command; must be
+  listed explicitly in the OAuth scopes when the app is distributed
 
 Configure, replacing `<host>` with the public backend origin (or the ngrok host locally):
 

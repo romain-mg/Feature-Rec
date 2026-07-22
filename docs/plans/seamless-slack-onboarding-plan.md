@@ -35,7 +35,8 @@ Messages include `owner/repo#N` for clarity.
 ### Slack app setup (manual, once)
 
 - Add `channels:read` and `groups:read` to the existing `chat:write`, `files:write`,
-`views:write`, and `usergroups:read` scopes.
+`views:write`, and `usergroups:read` scopes (`commands` rides along with the slash
+command; list it explicitly when distributing).
 - Add `/feature-rec` → `POST {base}/api/slack/commands`.
 - Subscribe `{base}/api/slack/events` to `member_joined_channel` and
 `member_left_channel`. Enable **Delayed Events**: after Slack's three retries
