@@ -44,6 +44,7 @@ type SlackEventEnvelope = {
   challenge?: string;
   team_id?: string;
   enterprise_id?: string | null;
+  event_id?: string;
   event?: {
     type?: string;
     user?: string;
@@ -250,7 +251,15 @@ export function buildServer(input: {
     // to fail frontend-visible PRs before rendering (seconds instead of a full
     // render) while auto-accepted PRs stay unaffected. Advisory only:
     // video-time resolution stays authoritative — channels can change mid-cycle.
-    const onboarded = await tenantHasChannels();
+    //
+    // Advisory means it must never fail the start: a Slack outage here would
+    // otherwise strand the cycle as `analyzing` with no attemptId returned, and
+    // every retry would exit as a duplicate. Unknown → omit the flag and let
+    // video-time resolution decide.
+    const onboarded = await tenantHasChannels().catch((err: unknown) => {
+      request.log.warn({ err }, "advisory onboarding check failed; deferring to video-time resolution");
+      return undefined;
+    });
 
     // Takeover of a previously `failed` cycle: reuse its existing check run
     // (set it back to in_progress) instead of creating a second one, so a
@@ -546,15 +555,29 @@ export function buildServer(input: {
         channelId,
         joinedAt: eventAt,
       });
-      void greetJoinedChannel(teamId, channelId).catch((err) => app.log.error(err));
+      if (await isFirstEventDelivery(body.event_id)) {
+        void greetJoinedChannel(teamId, channelId).catch((err) => app.log.error(err));
+      }
       return reply.send({ ok: true });
     }
 
     const activeBefore = await store.activeBotChannels(teamId);
     await store.recordChannelLeave({ teamId, channelId, leftAt: eventAt });
-    void notifyPromotion(teamId, channelId, activeBefore).catch((err) => app.log.error(err));
+    if (await isFirstEventDelivery(body.event_id)) {
+      void notifyPromotion(teamId, channelId, activeBefore).catch((err) => app.log.error(err));
+    }
     return reply.send({ ok: true });
   });
+
+  // Membership writes are idempotent; greetings and promotion notices are
+  // not. Slack retries deliveries (including after a lost ack, when we DID
+  // already post), so the human-facing side effects dedupe on the globally
+  // unique event_id. Recorded after the membership write: a crash between the
+  // two replays the idempotent write on retry and still greets exactly once.
+  async function isFirstEventDelivery(eventId: string | undefined): Promise<boolean> {
+    if (!eventId) return true;
+    return store.recordProcessedInteraction(`slack-event:${eventId}`, "slack-event");
+  }
 
   app.post("/api/slack/commands", async (request, reply) => {
     const rawBody = String(request.body ?? "");

@@ -1030,6 +1030,27 @@ try {
     assert.ok(
       (await store.activeBotChannels("TEVT")).some((channel) => channel.channelId === "CE5"),
     );
+
+    // Retried deliveries (same event_id) keep the idempotent membership write
+    // but must not greet twice.
+    const greetingsBefore = slack.postMessageCalls.length;
+    const retried = {
+      ...membershipEvent({
+        type: "member_joined_channel" as const,
+        teamId: "TEVT",
+        user: "UBOT",
+        channel: "CE6",
+        ts: "1710000007.000000",
+      }),
+      event_id: "Ev0RETRY01",
+    };
+    await postSlackEvent(app, retried);
+    await postSlackEvent(app, retried);
+    await sleep(150);
+    assert.equal(slack.postMessageCalls.length, greetingsBefore + 1);
+    assert.ok(
+      (await store.activeBotChannels("TEVT")).some((channel) => channel.channelId === "CE6"),
+    );
   }
 
   // --- Commands: mention set/off/echo/bad-handle, approvers, status, usage ---
@@ -1360,6 +1381,69 @@ try {
         async () => github.checkRuns.get(startA.checkRunId!)?.conclusion === "neutral",
       ),
     );
+  }
+
+  // --- Stale membership data cannot resurrect a newer leave ---
+  {
+    // A poll snapshot taken BEFORE the leave still lists the channel; the
+    // sweep must not clear the newer left_at.
+    await store.recordChannelJoin({
+      teamId: "TSTALE",
+      enterpriseId: null,
+      channelId: "CSTALE",
+      joinedAt: "2026-07-22T10:00:00.000Z",
+    });
+    await store.recordChannelLeave({
+      teamId: "TSTALE",
+      channelId: "CSTALE",
+      leftAt: "2026-07-22T10:05:00.000Z",
+    });
+    await store.syncBotChannels({
+      teamId: "TSTALE",
+      enterpriseId: null,
+      channelIds: ["CSTALE"],
+      seenAt: "2026-07-22T10:04:00.000Z",
+    });
+    assert.equal((await store.activeBotChannels("TSTALE")).length, 0);
+
+    // An out-of-order join event (older than the leave, e.g. a delayed
+    // retry) must not resurrect it either.
+    await store.recordChannelJoin({
+      teamId: "TSTALE",
+      enterpriseId: null,
+      channelId: "CSTALE",
+      joinedAt: "2026-07-22T10:03:00.000Z",
+    });
+    assert.equal((await store.activeBotChannels("TSTALE")).length, 0);
+
+    // A genuinely fresh poll (snapshot after the leave) revives the channel
+    // as a NEW introduction with reset ordering.
+    await store.syncBotChannels({
+      teamId: "TSTALE",
+      enterpriseId: null,
+      channelIds: ["CSTALE"],
+      seenAt: "2026-07-22T10:10:00.000Z",
+    });
+    const revived = await store.activeBotChannels("TSTALE");
+    assert.equal(revived.length, 1);
+    assert.equal(revived[0].joinedAt, null);
+    assert.equal(revived[0].firstSeenAt, "2026-07-22T10:10:00.000Z");
+  }
+
+  // --- Advisory onboarding probe failure cannot stall the start ---
+  {
+    // The Slack sweep throwing must not 500 the start: the cycle would stay
+    // `analyzing` with no attemptId returned, and retries would exit as
+    // duplicates forever. Unknown onboarding → flag omitted, start succeeds.
+    const slack = makeSlackStub({ teamId: "TPROBE", channels: [] });
+    slack.listBotChannels = async () => {
+      throw new Error("slack is down");
+    };
+    const app = makeApp(makeGithubStub(), slack);
+    const start = await startRun(app, makeStart(26, { headSha: "probe00001" }));
+    assert.equal(start.res.statusCode, 200);
+    assert.ok(start.body.attemptId);
+    assert.equal(start.body.onboarded, undefined);
   }
 
   // --- Writes after close() reject (pg pool, not a synchronous throw) ---

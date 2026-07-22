@@ -262,10 +262,21 @@ export class PostgresCycleStore implements CycleStore {
               enterprise_id: (eb) => eb.ref("excluded.enterprise_id"),
               last_seen_at: (eb) => eb.ref("excluded.last_seen_at"),
               // Rejoin after a leave is a new introduction: reset ordering so
-              // the channel cannot steal the active slot.
-              joined_at: sql`case when bot_channels.left_at is null then bot_channels.joined_at else null end`,
-              first_seen_at: sql`case when bot_channels.left_at is null then bot_channels.first_seen_at else excluded.first_seen_at end`,
-              left_at: null,
+              // the channel cannot steal the active slot. A leave recorded at
+              // or after the poll snapshot (excluded.last_seen_at = seenAt) is
+              // NEWER than this poll's stale membership list and must survive
+              // it — routing must never resurrect a channel the bot just left.
+              joined_at: sql`case
+                when bot_channels.left_at is null then bot_channels.joined_at
+                when bot_channels.left_at >= excluded.last_seen_at then bot_channels.joined_at
+                else null end`,
+              first_seen_at: sql`case
+                when bot_channels.left_at is null then bot_channels.first_seen_at
+                when bot_channels.left_at >= excluded.last_seen_at then bot_channels.first_seen_at
+                else excluded.first_seen_at end`,
+              left_at: sql`case
+                when bot_channels.left_at is not null and bot_channels.left_at >= excluded.last_seen_at then bot_channels.left_at
+                else null end`,
             }),
           )
           .execute();
@@ -323,10 +334,20 @@ export class PostgresCycleStore implements CycleStore {
           last_seen_at: (eb) => eb.ref("excluded.last_seen_at"),
           // Rejoin restarts ordering at the event time; an active channel keeps
           // its known ordering (retried deliveries and poll-seeded rows only
-          // fill a missing joined_at, never move an established one).
-          joined_at: sql`case when bot_channels.left_at is null then coalesce(bot_channels.joined_at, excluded.joined_at) else excluded.joined_at end`,
-          first_seen_at: sql`case when bot_channels.left_at is null then bot_channels.first_seen_at else excluded.first_seen_at end`,
-          left_at: null,
+          // fill a missing joined_at, never move an established one). A join
+          // event OLDER than the recorded leave (out-of-order or delayed retry
+          // delivery) must not resurrect the channel.
+          joined_at: sql`case
+            when bot_channels.left_at is null then coalesce(bot_channels.joined_at, excluded.joined_at)
+            when bot_channels.left_at >= excluded.joined_at then bot_channels.joined_at
+            else excluded.joined_at end`,
+          first_seen_at: sql`case
+            when bot_channels.left_at is null then bot_channels.first_seen_at
+            when bot_channels.left_at >= excluded.joined_at then bot_channels.first_seen_at
+            else excluded.first_seen_at end`,
+          left_at: sql`case
+            when bot_channels.left_at is not null and bot_channels.left_at >= excluded.joined_at then bot_channels.left_at
+            else null end`,
         }),
       )
       .execute();
