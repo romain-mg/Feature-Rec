@@ -58,7 +58,6 @@ export type CycleStore = {
   // snapshot was taken, so rows seen since then are never reaped by stale data.
   syncBotChannels(input: {
     teamId: string;
-    enterpriseId: string | null;
     channelIds: string[];
     seenAt: string;
   }): Promise<void>;
@@ -66,7 +65,6 @@ export type CycleStore = {
   activeBotChannels(teamId: string): Promise<BotChannel[]>;
   recordChannelJoin(input: {
     teamId: string;
-    enterpriseId: string | null;
     channelId: string;
     joinedAt: string;
   }): Promise<void>;

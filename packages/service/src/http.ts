@@ -43,7 +43,6 @@ type SlackEventEnvelope = {
   type?: string;
   challenge?: string;
   team_id?: string;
-  enterprise_id?: string | null;
   event_id?: string;
   event?: {
     type?: string;
@@ -551,7 +550,6 @@ export function buildServer(input: {
     if (isJoin) {
       await store.recordChannelJoin({
         teamId,
-        enterpriseId: body.enterprise_id ?? null,
         channelId,
         joinedAt: eventAt,
       });

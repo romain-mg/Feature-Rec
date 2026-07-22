@@ -21,7 +21,6 @@ export async function syncTenantChannels(
   const channelIds = await slack.listBotChannels();
   await store.syncBotChannels({
     teamId: identity.teamId,
-    enterpriseId: identity.enterpriseId,
     channelIds,
     seenAt,
   });

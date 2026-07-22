@@ -5,7 +5,6 @@ export async function up(db: Kysely<unknown>): Promise<void> {
     .createTable("bot_channels")
     .addColumn("team_id", "text", (col) => col.notNull())
     .addColumn("channel_id", "text", (col) => col.notNull())
-    .addColumn("enterprise_id", "text")
     .addColumn("joined_at", "timestamptz")
     .addColumn("first_seen_at", "timestamptz", (col) => col.notNull())
     .addColumn("last_seen_at", "timestamptz", (col) => col.notNull())

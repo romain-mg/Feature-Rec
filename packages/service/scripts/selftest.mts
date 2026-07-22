@@ -122,7 +122,7 @@ function makeSlackStub(options: { teamId?: string; channels?: string[] } = {}) {
     postValidationCalls: 0,
     isApproverCalls: 0,
     finalizeCalls,
-    botIdentity: async () => ({ userId: "UBOT", teamId, enterpriseId: null }),
+    botIdentity: async () => ({ userId: "UBOT", teamId }),
     listBotChannels: async (): Promise<string[]> => [...stub.channels],
     listUsergroups: async (): Promise<Array<{ id: string; handle: string }>> => stub.usergroups,
     postMessage: async (channel: string, text: string): Promise<void> => {
@@ -840,13 +840,11 @@ try {
     // Join events carry exact times; CA is the older introduction.
     await store.recordChannelJoin({
       teamId: "TROUTE",
-      enterpriseId: null,
       channelId: "CA",
       joinedAt: "2026-01-01T00:00:01.000Z",
     });
     await store.recordChannelJoin({
       teamId: "TROUTE",
-      enterpriseId: null,
       channelId: "CB",
       joinedAt: "2026-01-01T00:00:02.000Z",
     });
@@ -865,7 +863,6 @@ try {
     // Rejoin goes to the back of the queue: CB keeps the active slot.
     await store.recordChannelJoin({
       teamId: "TROUTE",
-      enterpriseId: null,
       channelId: "CA",
       joinedAt: "2026-01-01T00:00:04.000Z",
     });
@@ -884,13 +881,11 @@ try {
     // sync whose channel list predates it.
     await store.recordChannelJoin({
       teamId: "TROUTE",
-      enterpriseId: null,
       channelId: "CD",
       joinedAt: new Date().toISOString(),
     });
     await store.syncBotChannels({
       teamId: "TROUTE",
-      enterpriseId: null,
       channelIds: ["CB"],
       seenAt: new Date(Date.now() - 60_000).toISOString(),
     });
@@ -1418,7 +1413,6 @@ try {
     // sweep must not clear the newer left_at.
     await store.recordChannelJoin({
       teamId: "TSTALE",
-      enterpriseId: null,
       channelId: "CSTALE",
       joinedAt: "2026-07-22T10:00:00.000Z",
     });
@@ -1429,7 +1423,6 @@ try {
     });
     await store.syncBotChannels({
       teamId: "TSTALE",
-      enterpriseId: null,
       channelIds: ["CSTALE"],
       seenAt: "2026-07-22T10:04:00.000Z",
     });
@@ -1439,7 +1432,6 @@ try {
     // retry) must not resurrect it either.
     await store.recordChannelJoin({
       teamId: "TSTALE",
-      enterpriseId: null,
       channelId: "CSTALE",
       joinedAt: "2026-07-22T10:03:00.000Z",
     });
@@ -1449,7 +1441,6 @@ try {
     // as a NEW introduction with reset ordering.
     await store.syncBotChannels({
       teamId: "TSTALE",
-      enterpriseId: null,
       channelIds: ["CSTALE"],
       seenAt: "2026-07-22T10:10:00.000Z",
     });

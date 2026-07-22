@@ -1,7 +1,13 @@
 # Multitenancy Notes
 
 Single-workspace assumptions currently baked into the service, recorded so the
-multitenant redesign revisits them deliberately. Both concern how the backend
+multitenant redesign revisits them deliberately.
+
+Note: v0 stores no `enterprise_id` anywhere. That is safe to defer because it
+is always derivable — in the single-token era every row belongs to the token's
+org (`auth.test` reports it), and at multitenancy time the org↔workspace
+pairing table knows each team's org — so re-adding it is one nullable-column
+migration plus a one-line backfill. Both concern how the backend
 decides "which workspace am I talking to" — today there is exactly one answer,
 so simple designs are correct; multi-workspace makes the same designs hazards.
 

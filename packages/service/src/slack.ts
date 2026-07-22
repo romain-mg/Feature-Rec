@@ -8,7 +8,6 @@ type SlackResponse<T> = T & { ok: boolean; error?: string };
 export type BotIdentity = {
   userId: string;
   teamId: string;
-  enterpriseId: string | null;
 };
 
 export type SlackUsergroup = {
@@ -135,12 +134,10 @@ export class SlackClient {
     this.#identity ??= slackApi<{
       user_id: string;
       team_id: string;
-      enterprise_id?: string | null;
     }>(this.#env, "auth.test", {}).then(
       (res) => ({
         userId: res.user_id,
         teamId: res.team_id,
-        enterpriseId: res.enterprise_id ?? null,
       }),
       (err: unknown) => {
         this.#identity = null;

@@ -238,7 +238,6 @@ export class PostgresCycleStore implements CycleStore {
 
   async syncBotChannels(input: {
     teamId: string;
-    enterpriseId: string | null;
     channelIds: string[];
     // When the membership snapshot was taken (before the Slack API call), so a
     // join event that lands mid-poll is not reaped by the poll's stale list.
@@ -252,14 +251,12 @@ export class PostgresCycleStore implements CycleStore {
             input.channelIds.map((channelId) => ({
               team_id: input.teamId,
               channel_id: channelId,
-              enterprise_id: input.enterpriseId,
               first_seen_at: input.seenAt,
               last_seen_at: input.seenAt,
             })),
           )
           .onConflict((oc) =>
             oc.columns(["team_id", "channel_id"]).doUpdateSet({
-              enterprise_id: (eb) => eb.ref("excluded.enterprise_id"),
               last_seen_at: (eb) => eb.ref("excluded.last_seen_at"),
               // Rejoin after a leave is a new introduction: reset ordering so
               // the channel cannot steal the active slot. A leave recorded at
@@ -314,7 +311,6 @@ export class PostgresCycleStore implements CycleStore {
 
   async recordChannelJoin(input: {
     teamId: string;
-    enterpriseId: string | null;
     channelId: string;
     joinedAt: string;
   }): Promise<void> {
@@ -323,14 +319,12 @@ export class PostgresCycleStore implements CycleStore {
       .values({
         team_id: input.teamId,
         channel_id: input.channelId,
-        enterprise_id: input.enterpriseId,
         joined_at: input.joinedAt,
         first_seen_at: input.joinedAt,
         last_seen_at: input.joinedAt,
       })
       .onConflict((oc) =>
         oc.columns(["team_id", "channel_id"]).doUpdateSet({
-          enterprise_id: (eb) => eb.ref("excluded.enterprise_id"),
           last_seen_at: (eb) => eb.ref("excluded.last_seen_at"),
           // Rejoin restarts ordering at the event time; an active channel keeps
           // its known ordering (retried deliveries and poll-seeded rows only

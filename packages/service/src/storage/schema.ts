@@ -33,7 +33,6 @@ export interface ProcessedInteractionsTable {
 export interface BotChannelsTable {
   team_id: string;
   channel_id: string;
-  enterprise_id: string | null;
   joined_at: ColumnType<Date | null, string | null | undefined, string | null>;
   first_seen_at: ColumnType<Date, string, string>;
   last_seen_at: ColumnType<Date, string, string>;

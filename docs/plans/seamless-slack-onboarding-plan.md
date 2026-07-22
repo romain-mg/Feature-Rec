@@ -27,7 +27,7 @@ Messages include `owner/repo#N` for clarity.
 | Mention           | Default to positional, non-personal `@here`. Allow a per-channel override with `/feature-rec mention <targets>` where targets are a usergroup, a user or list of users, `@here`, `@channel`, or `off`, stored server-side. No YAML key.                                                                                                                                                                                                         |
 | Approvers         | Default to everyone in the channel: visibility is the gate, so one person's absence cannot block a merge. Optionally restrict a channel with `/feature-rec approvers @usergroup [@user …]`. Check on click and answer unauthorized clicks ephemerally with “Only @product-team can approve”; never drop them silently. `everyone` resets the setting. This is independent of mention, and replaces the former `approverUsergroups` YAML key.    |
 | YAML              | None. The config file is removed entirely: the action reads no file, and `config`/`configHash` leave the runner protocol (`cycleKey` becomes `owner/repo#N:headSha`). Existing `.github/feature-rec-config.yaml` files are simply ignored.                                                                                                                                                                                                      |
-| Multitenancy      | Not implemented, but routing already means “oldest active channel WHERE `team_id = tenant`.” Store `team_id`/`enterprise_id` now and put token access behind `tokenForTeam()` (the env token today). Multitenancy adds org↔workspace pairing and per-team tokens, without changing channel selection. Pairing is never user-facing: create it during Slack + GitHub OAuth on a setup page, or manage it operationally; never expose `/connect`. |
+| Multitenancy      | Not implemented, but routing already means “oldest active channel WHERE `team_id = tenant`.” Store `team_id` now and put token access behind `tokenForTeam()` (the env token today); v0 carries no `enterprise_id` — re-added at multitenancy time with a derivable backfill. Multitenancy adds org↔workspace pairing and per-team tokens, without changing channel selection. Pairing is never user-facing: create it during Slack + GitHub OAuth on a setup page, or manage it operationally; never expose `/connect`. |
 
 
 ## Architecture
@@ -51,7 +51,6 @@ a down backend returning 5xx cannot disable this subscription.
 bot_channels
   team_id        text               -- PK (team_id, channel_id)
   channel_id     text
-  enterprise_id  text NULL          -- reserved for Enterprise Grid
   joined_at      timestamptz NULL   -- exact event time
   first_seen_at  timestamptz        -- polling fallback
   last_seen_at   timestamptz
@@ -167,7 +166,10 @@ is the tenant; operator-managed rows can bridge early customers.
 - **Per-team tokens:** replace the internals of `tokenForTeam()`; it uses the env token
 today.
 - **GitHub OIDC runner auth:** replace the shared bearer token.
-- **Enterprise Grid installs:** `enterprise_id` is already reserved.
+- **Enterprise Grid installs:** add an `enterprise_id` column at multitenancy time.
+  The backfill is derivable — in the single-token era every row belongs to the
+  token's org (`auth.test`), and later the pairing table knows each team's org —
+  so deferring the column loses nothing.
 
 ## Dev plan
 
