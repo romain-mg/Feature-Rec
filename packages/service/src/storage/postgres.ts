@@ -357,8 +357,8 @@ export class PostgresCycleStore implements CycleStore {
     teamId: string;
     channelId: string;
     leftAt: string;
-  }): Promise<void> {
-    await this.#db
+  }): Promise<boolean> {
+    const result = await this.#db
       .updateTable("bot_channels")
       .set({ left_at: input.leftAt })
       .where("team_id", "=", input.teamId)
@@ -369,7 +369,8 @@ export class PostgresCycleStore implements CycleStore {
       // newer poll: it must not deactivate the current membership. Skipping is
       // safe — if the bot really is gone, the next poll reaps the row.
       .where("last_seen_at", "<=", new Date(input.leftAt))
-      .execute();
+      .executeTakeFirst();
+    return (result.numUpdatedRows ?? 0n) > 0n;
   }
 
   async getChannelSettings(teamId: string, channelId: string): Promise<ChannelSettings | null> {

@@ -562,8 +562,11 @@ export function buildServer(input: {
     }
 
     const activeBefore = await store.activeBotChannels(teamId);
-    await store.recordChannelLeave({ teamId, channelId, leftAt: eventAt });
-    if (await isFirstEventDelivery(body.event_id)) {
+    // A stale leave (older than the latest observed membership, e.g. a
+    // delayed first delivery after a rejoin) changes nothing, so it must not
+    // announce a promotion the channel never went through.
+    const left = await store.recordChannelLeave({ teamId, channelId, leftAt: eventAt });
+    if (left && (await isFirstEventDelivery(body.event_id))) {
       void notifyPromotion(teamId, channelId, activeBefore).catch((err) => app.log.error(err));
     }
     return reply.send({ ok: true });

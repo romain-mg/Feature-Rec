@@ -70,11 +70,14 @@ export type CycleStore = {
     channelId: string;
     joinedAt: string;
   }): Promise<void>;
+  // Resolves true when the leave was applied; false when it was ignored as
+  // stale (older than the latest observed membership), so callers must not
+  // act on it — e.g. no promotion notice for a leave that changed nothing.
   recordChannelLeave(input: {
     teamId: string;
     channelId: string;
     leftAt: string;
-  }): Promise<void>;
+  }): Promise<boolean>;
   getChannelSettings(teamId: string, channelId: string): Promise<ChannelSettings | null>;
   setMention(input: {
     teamId: string;

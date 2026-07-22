@@ -1054,6 +1054,32 @@ try {
     assert.ok(
       (await store.activeBotChannels("TEVT")).some((channel) => channel.channelId === "CE6"),
     );
+
+    // A delayed FIRST delivery of an old leave (fresh event_id, stale
+    // event_ts) for the active channel: the store ignores it, so the handler
+    // must not post a promotion notice for a promotion that never happened.
+    // CE5's greeting is detached, so settle it before taking a global baseline.
+    assert.ok(
+      await waitFor(
+        async () =>
+          slack.postMessageCalls.filter((message) => message.channel === "CE5").length === 1,
+      ),
+    );
+    const activeHead = (await store.activeBotChannels("TEVT"))[0];
+    const messagesBefore = slack.postMessageCalls.length;
+    await postSlackEvent(app, {
+      ...membershipEvent({
+        type: "member_left_channel" as const,
+        teamId: "TEVT",
+        user: "UBOT",
+        channel: activeHead.channelId,
+        ts: "1710000000.500000", // older than every recorded membership
+      }),
+      event_id: "Ev0STALELEAVE",
+    });
+    await sleep(150);
+    assert.equal(slack.postMessageCalls.length, messagesBefore);
+    assert.equal((await store.activeBotChannels("TEVT"))[0]?.channelId, activeHead.channelId);
   }
 
   // --- Commands: mention set/off/echo/bad-handle, approvers, status, usage ---
