@@ -6,9 +6,10 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "selftest": "tsx scripts/selftest.mts"
+    "selftest": "tsx scripts/selftest.mts && tsx scripts/backend-selftest.mts"
   },
   "dependencies": {
+    "@actions/core": "^3.0.1",
     "@anthropic-ai/sdk": "^0.106.0",
     "@autodemo/cli": "workspace:*",
     "@feature-rec/core": "workspace:*",

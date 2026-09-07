@@ -132,7 +132,7 @@ The GitHub Actions job and the Feature-Rec application Check Run are separate ga
 2. Require the GitHub Actions check named `CI`.
 3. Apply the rule to any users or roles that should not be allowed to bypass these gates.
 
-Update the README and `docs/feature-rec.md` during implementation so they instruct maintainers to require both checks, rather than presenting either check as a replacement for the other.
+Update the README and `docs/setup-and-operations.md` during implementation so they instruct maintainers to require both checks, rather than presenting either check as a replacement for the other.
 
 ## Deliberately out of scope
 

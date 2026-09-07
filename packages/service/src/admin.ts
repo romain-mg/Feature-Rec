@@ -98,7 +98,7 @@ function providers(env: ServiceEnv): AdminProviders {
   const github = new GitHubClient(env);
   return {
     inspectSlackToken: async (token) => {
-      const slack = new SlackClient({ ...env, slackBotToken: token });
+      const slack = new SlackClient(token);
       const [identity, channelIds] = await Promise.all([
         slack.botIdentity(),
         slack.listBotChannels(),
@@ -184,7 +184,8 @@ async function main(): Promise<void> {
       return;
     }
 
-    const env = readEnv();
+    // Administrative provider calls do not authenticate runners or serve a public URL.
+    const env = readEnv({ ...process.env, FEATURE_REC_BASE_URL: "https://admin.invalid" });
     if (args.command === "validate-contract-readiness") {
       const report = await validateMultitenancy({
         db,
@@ -201,7 +202,7 @@ async function main(): Promise<void> {
       const report = await backfillMultitenancy({
         db,
         providers: providers(env),
-        slackBotToken: env.slackBotToken,
+        slackBotToken: process.env.SLACK_BOT_TOKEN ?? "",
         encryptionKey: requireEncryptionKey(env),
         tenantId: flag(args, "tenant-id"),
         apply: mode.apply,

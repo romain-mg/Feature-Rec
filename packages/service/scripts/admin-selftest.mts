@@ -364,7 +364,7 @@ try {
   const startService = (encryptionKey: Buffer) => {
     const child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
       cwd: fileURLToPath(new URL("../", import.meta.url)),
-      env: { ...process.env, DATABASE_URL: testUrl, PORT: String(port), FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY: encryptionKey.toString("base64"), GITHUB_OIDC_ISSUER: "https://token.actions.githubusercontent.com" },
+      env: { ...process.env, DATABASE_URL: testUrl, PORT: String(port), FEATURE_REC_BASE_URL: "https://service-selftest.invalid", FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY: encryptionKey.toString("base64"), GITHUB_OIDC_ISSUER: "https://token.actions.githubusercontent.com" },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let logs = "";

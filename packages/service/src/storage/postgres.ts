@@ -4,18 +4,21 @@ import type { Selectable, Transaction } from "kysely";
 import { Migrator } from "kysely/migration";
 import { Pool } from "pg";
 import { z } from "zod";
-import type { ReviewCycleStatus, RunStartRequest } from "@feature-rec/core";
+import type { ReviewCycleStatus } from "@feature-rec/core";
 import {
   DEFAULT_CHANNEL_SETTINGS,
   type ChannelSettings,
   type CycleRecord,
   type CycleStore,
+  type GitHubInstallation,
   type MentionSetting,
+  type SlackWorkspace,
+  type StartCycleInput,
   type StartCycleResult,
 } from "../storage";
 import type { DB, ReviewCyclesTable } from "./schema";
 import { migrationProvider } from "./migrations";
-import { lockTeamChannelRoute, withMigrationLock } from "./locks";
+import { lockTeamChannelRoute, lockTenantProvisioning, withMigrationLock } from "./locks";
 import { readSelectedChannel, writeSelectedChannel } from "./channel-routing";
 import { inspectSlackTokenEncryption } from "./slack-token-check";
 
@@ -32,14 +35,16 @@ function now(): string {
 }
 
 function rowToCycle(row: Selectable<ReviewCyclesTable>): CycleRecord {
-  if (row.owner === null || row.repo === null) {
+  if (row.tenant_id === null || row.repository_id === null) {
     throw new Error(
-      `Review cycle ${row.id} has no repository coordinates required by the compatibility runtime`,
+      `Review cycle ${row.id} has no authenticated tenant/repository identity; complete backfill before cutover`,
     );
   }
   return {
     id: row.id,
     cycleKey: row.cycle_key,
+    tenantId: row.tenant_id,
+    repositoryId: String(row.repository_id),
     owner: row.owner,
     repo: row.repo,
     prNumber: row.pr_number,
@@ -77,8 +82,85 @@ export class PostgresCycleStore implements CycleStore {
     return inspectSlackTokenEncryption(this.#db, key);
   }
 
-  async startCycle(input: RunStartRequest & { cycleKey: string }): Promise<StartCycleResult> {
-    const lockKey = `${input.owner}/${input.repo}#${input.prNumber}`;
+  async getEnabledGitHubInstallationByAccountId(accountId: string): Promise<GitHubInstallation | null> {
+    const row = await this.#db.selectFrom("github_installations")
+      .innerJoin("tenants", "tenants.id", "github_installations.tenant_id")
+      .select([
+        "github_installations.tenant_id as tenantId",
+        "installation_id as installationId",
+        "github_account_id as githubAccountId",
+        "enabled",
+      ])
+      .where("github_account_id", "=", accountId).where("enabled", "=", true)
+      .executeTakeFirst();
+    return row ?? null;
+  }
+
+  async getGitHubInstallationByTenantId(tenantId: string): Promise<GitHubInstallation | null> {
+    const row = await this.#db.selectFrom("github_installations")
+      .innerJoin("tenants", "tenants.id", "github_installations.tenant_id")
+      .select([
+        "github_installations.tenant_id as tenantId",
+        "installation_id as installationId",
+        "github_account_id as githubAccountId",
+        "enabled",
+      ])
+      .where("github_installations.tenant_id", "=", tenantId).executeTakeFirst();
+    return row ?? null;
+  }
+
+  async getSlackWorkspaceByTeamId(teamId: string): Promise<SlackWorkspace | null> {
+    const row = await this.#db.selectFrom("slack_workspaces")
+      .innerJoin("tenants", "tenants.id", "slack_workspaces.tenant_id")
+      .select([
+        "slack_workspaces.tenant_id as tenantId",
+        "team_id as teamId",
+        "bot_user_id as botUserId",
+        "bot_token_ciphertext as botTokenCiphertext",
+        "selected_channel_id as selectedChannelId",
+        "enabled",
+      ])
+      .where("team_id", "=", teamId).executeTakeFirst();
+    return row ?? null;
+  }
+
+  async getSlackWorkspaceByTenantId(tenantId: string): Promise<SlackWorkspace | null> {
+    const row = await this.#db.selectFrom("slack_workspaces")
+      .innerJoin("tenants", "tenants.id", "slack_workspaces.tenant_id")
+      .select([
+        "slack_workspaces.tenant_id as tenantId",
+        "team_id as teamId",
+        "bot_user_id as botUserId",
+        "bot_token_ciphertext as botTokenCiphertext",
+        "selected_channel_id as selectedChannelId",
+        "enabled",
+      ])
+      .where("slack_workspaces.tenant_id", "=", tenantId).executeTakeFirst();
+    return row ?? null;
+  }
+
+  async deleteSlackWorkspace(teamId: string, expectedTokenCiphertext: string): Promise<boolean> {
+    return this.#db.transaction().execute(async (trx) => {
+      // Provisioning uses the same lock order and always writes fresh randomized
+      // ciphertext. If it replaced the token during auth.test, leave the new
+      // installation, its settings, and tenant enablement untouched.
+      await lockTenantProvisioning(trx);
+      await lockTeamChannelRoute(trx, teamId);
+      const workspace = await trx.deleteFrom("slack_workspaces")
+        .where("team_id", "=", teamId)
+        .where("bot_token_ciphertext", "=", expectedTokenCiphertext)
+        .returning("tenant_id").executeTakeFirst();
+      if (!workspace) return false;
+      await trx.deleteFrom("channel_settings").where("team_id", "=", teamId).execute();
+      await trx.deleteFrom("team_channel_routes").where("team_id", "=", teamId).execute();
+      await trx.updateTable("tenants").set({ enabled: false })
+        .where("id", "=", workspace.tenant_id).execute();
+      return true;
+    });
+  }
+
+  async startCycle(input: StartCycleInput): Promise<StartCycleResult> {
+    const lockKey = `${input.tenantId}/${input.repositoryId}#${input.prNumber}`;
     return this.#db.transaction().execute(async (trx) => {
       // Per-PR serialization: 64-bit advisory lock held until commit. Bound
       // value (not string-concatenated SQL); hashtextextended keeps 64 bits.
@@ -93,6 +175,8 @@ export class PostgresCycleStore implements CycleStore {
         .values({
           id,
           cycle_key: input.cycleKey,
+          tenant_id: input.tenantId,
+          repository_id: input.repositoryId,
           owner: input.owner,
           repo: input.repo,
           pr_number: input.prNumber,
@@ -141,8 +225,8 @@ export class PostgresCycleStore implements CycleStore {
       const supersededRows = await trx
         .updateTable("review_cycles")
         .set({ status: "superseded", updated_at: now() })
-        .where("owner", "=", input.owner)
-        .where("repo", "=", input.repo)
+        .where("tenant_id", "=", input.tenantId)
+        .where("repository_id", "=", input.repositoryId)
         .where("pr_number", "=", input.prNumber)
         .where("head_sha", "!=", input.headSha)
         .where("status", "in", ["analyzing", "pending_validation"])
@@ -190,6 +274,8 @@ export class PostgresCycleStore implements CycleStore {
   // funnel through one guarded UPDATE so the SQL lives in a single place.
   async #transitionStatus(input: {
     cycleId: string;
+    tenantId: string;
+    repositoryId?: string;
     attemptId?: string;
     from: ReviewCycleStatus[];
     to: ReviewCycleStatus;
@@ -198,7 +284,11 @@ export class PostgresCycleStore implements CycleStore {
       .updateTable("review_cycles")
       .set({ status: input.to, updated_at: now() })
       .where("id", "=", input.cycleId)
+      .where("tenant_id", "=", input.tenantId)
       .where("status", "in", input.from);
+    if (input.repositoryId !== undefined) {
+      query = query.where("repository_id", "=", input.repositoryId);
+    }
     if (input.attemptId !== undefined) {
       query = query.where("attempt_id", "=", input.attemptId);
     }
@@ -208,6 +298,8 @@ export class PostgresCycleStore implements CycleStore {
 
   transitionRunnerStatus(input: {
     cycleId: string;
+    tenantId: string;
+    repositoryId: string;
     attemptId: string;
     from: ReviewCycleStatus[];
     to: ReviewCycleStatus;
@@ -217,6 +309,7 @@ export class PostgresCycleStore implements CycleStore {
 
   transitionSlackStatus(input: {
     cycleId: string;
+    tenantId: string;
     from: ReviewCycleStatus[];
     to: ReviewCycleStatus;
   }): Promise<CycleRecord | null> {

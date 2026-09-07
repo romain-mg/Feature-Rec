@@ -20,6 +20,9 @@ importers:
 
   packages/action:
     dependencies:
+      '@actions/core':
+        specifier: ^3.0.1
+        version: 3.0.1
       '@anthropic-ai/sdk':
         specifier: ^0.106.0
         version: 0.106.0(zod@3.25.76)
@@ -53,13 +56,13 @@ importers:
         version: link:../video
       '@remotion/bundler':
         specifier: 4.0.484
-        version: 4.0.484(postcss@8.5.15)(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
+        version: 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
       '@remotion/renderer':
         specifier: 4.0.484
         version: 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
       '@remotion/tailwind-v4':
         specifier: 4.0.484
-        version: 4.0.484(@remotion/bundler@4.0.484(postcss@8.5.15)(react-dom@19.0.0(react@19.0.0))(react@19.0.0))(@rspack/core@1.7.11)(webpack@5.105.0(postcss@8.5.15))
+        version: 4.0.484(@remotion/bundler@4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0))(@rspack/core@1.7.11)(webpack@5.105.0)
       commander:
         specifier: ^12.1.0
         version: 12.1.0
@@ -101,6 +104,9 @@ importers:
       fastify:
         specifier: ^5.8.5
         version: 5.8.5
+      jose:
+        specifier: ^6.2.11
+        version: 6.2.11
       kysely:
         specifier: ^0.29.3
         version: 0.29.3
@@ -134,10 +140,10 @@ importers:
     dependencies:
       '@remotion/bundler':
         specifier: 4.0.484
-        version: 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
+        version: 4.0.484(postcss@8.5.15)(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
       '@remotion/cli':
         specifier: 4.0.484
-        version: 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
+        version: 4.0.484(postcss@8.5.15)(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
       '@remotion/google-fonts':
         specifier: 4.0.484
         version: 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
@@ -149,7 +155,7 @@ importers:
         version: 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
       '@remotion/tailwind-v4':
         specifier: 4.0.484
-        version: 4.0.484(@remotion/bundler@4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0))(@rspack/core@1.7.11)(webpack@5.105.0)
+        version: 4.0.484(@remotion/bundler@4.0.484(postcss@8.5.15)(react-dom@19.0.0(react@19.0.0))(react@19.0.0))(@rspack/core@1.7.11)(webpack@5.105.0(postcss@8.5.15))
       react:
         specifier: 19.0.0
         version: 19.0.0
@@ -177,6 +183,18 @@ importers:
         version: 5.9.3
 
 packages:
+
+  '@actions/core@3.0.1':
+    resolution: {integrity: sha512-a6d/Nwahm9fliVGRhdhofo40HjHQasUPusmc7vBfyky+7Z+P2A1J68zyFVaNcEclc/Se+eO595oAr5nwEIoIUA==}
+
+  '@actions/exec@3.0.0':
+    resolution: {integrity: sha512-6xH/puSoNBXb72VPlZVm7vQ+svQpFyA96qdDBvhB8eNZOE8LtPf9L4oAsfzK/crCL8YZ+19fKYVnM63Sl+Xzlw==}
+
+  '@actions/http-client@4.0.1':
+    resolution: {integrity: sha512-+Nvd1ImaOZBSoPbsUtEhv+1z99H12xzncCkz0a3RuehINE81FZSe2QTj3uvAPTcJX/SCzUQHQ0D1GrPMbrPitg==}
+
+  '@actions/io@3.0.2':
+    resolution: {integrity: sha512-nRBchcMM+QK1pdjO7/idu86rbJI5YHUKCvKs0KxnSYbVe3F51UfGxuZX4Qy/fWlp6l7gWFwIkrOzN+oUK03kfw==}
 
   '@alloc/quick-lru@5.2.0':
     resolution: {integrity: sha512-UrcABB+4bUrFABwbluTIBErXwvbsU/V7TZWfmbgJfbkwiBuziS9gxdODUyuiecfdGQ85jglMW6juS3+z5TsKLw==}
@@ -1657,6 +1675,9 @@ packages:
     resolution: {integrity: sha512-AC/7JofJvZGrrneWNaEnJeOLUx+JlGt7tNa0wZiRPT4MY1wmfKjt2+6O2p2uz2+skll8OZZmJMNqeke7kKbNgQ==}
     hasBin: true
 
+  jose@6.2.11:
+    resolution: {integrity: sha512-A5NPn7g8EAzGU3IzRs+Yiq8K5n3ypYS75M5+KKiVHdUexfpWK1kP4ZMq7QnTGDoMj6TJ1dtcEJjW60yZDXS4hg==}
+
   joycon@3.1.1:
     resolution: {integrity: sha512-34wB/Y7MW7bzjKRjUKTa46I2Z7eV62Rkhva+KkopW7Qvv/OSWBqvkSY7vusOPrNuZcUG3tApvdVgNB8POj3SPw==}
     engines: {node: '>=10'}
@@ -2341,6 +2362,10 @@ packages:
     engines: {node: '>=18.0.0'}
     hasBin: true
 
+  tunnel@0.0.6:
+    resolution: {integrity: sha512-1h/Lnq9yajKY2PEbBadPXj3VxsDDu844OnaAo52UVmIzIvwwtBPIuNvkjuzBlTWpfJyUbG3ez0KSBibQkj4ojg==}
+    engines: {node: '>=0.6.11 <=0.7.0 || >=0.7.3'}
+
   type-check@0.4.0:
     resolution: {integrity: sha512-XleUoc9uwGXqjWwXaUTZAmzMcFZ5858QA2vvx1Ur5xIcixXIP+8LnFDgRplU30us6teqdlskFfu+ae4K79Ooew==}
     engines: {node: '>= 0.8.0'}
@@ -2362,6 +2387,10 @@ packages:
 
   undici-types@7.18.2:
     resolution: {integrity: sha512-AsuCzffGHJybSaRrmr5eHr81mwJU3kjw6M+uprWvCXiNeN9SOGwQ3Jn8jb8m3Z6izVgknn1R0FTCEAP2QrLY/w==}
+
+  undici@6.28.0:
+    resolution: {integrity: sha512-LIY910g9TI13YS95lrMFrs8Rm/u/irgHeTWoKCoteeJ04CUJ92eEfj0rVn+7VKMPBpUPiUoBKfhNyLI23EE/KA==}
+    engines: {node: '>=18.17'}
 
   update-browserslist-db@1.2.3:
     resolution: {integrity: sha512-Js0m9cx+qOgDxo0eMiFGEueWztz+d4+M3rGlmKPT+T4IS/jP4ylw3Nwpu6cpTTP8R1MAC1kF4VbdLt3ARf209w==}
@@ -2443,6 +2472,22 @@ packages:
     resolution: {integrity: sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg==}
 
 snapshots:
+
+  '@actions/core@3.0.1':
+    dependencies:
+      '@actions/exec': 3.0.0
+      '@actions/http-client': 4.0.1
+
+  '@actions/exec@3.0.0':
+    dependencies:
+      '@actions/io': 3.0.2
+
+  '@actions/http-client@4.0.1':
+    dependencies:
+      tunnel: 0.0.6
+      undici: 6.28.0
+
+  '@actions/io@3.0.2': {}
 
   '@alloc/quick-lru@5.2.0': {}
 
@@ -2855,14 +2900,14 @@ snapshots:
       react-dom: 19.0.0(react@19.0.0)
       remotion: 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
 
-  '@remotion/cli@4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)':
+  '@remotion/cli@4.0.484(postcss@8.5.15)(react-dom@19.0.0(react@19.0.0))(react@19.0.0)':
     dependencies:
-      '@remotion/bundler': 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
+      '@remotion/bundler': 4.0.484(postcss@8.5.15)(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
       '@remotion/media-utils': 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
       '@remotion/player': 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
       '@remotion/renderer': 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
       '@remotion/studio': 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
-      '@remotion/studio-server': 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
+      '@remotion/studio-server': 4.0.484(postcss@8.5.15)(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
       '@remotion/studio-shared': 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
       dotenv: 17.3.1
       minimist: 1.2.6
@@ -2959,11 +3004,11 @@ snapshots:
 
   '@remotion/streaming@4.0.484': {}
 
-  '@remotion/studio-server@4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)':
+  '@remotion/studio-server@4.0.484(postcss@8.5.15)(react-dom@19.0.0(react@19.0.0))(react@19.0.0)':
     dependencies:
       '@babel/parser': 7.24.1
       '@babel/types': 7.24.0
-      '@remotion/bundler': 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
+      '@remotion/bundler': 4.0.484(postcss@8.5.15)(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
       '@remotion/renderer': 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
       '@remotion/studio-shared': 4.0.484(react-dom@19.0.0(react@19.0.0))(react@19.0.0)
       memfs: 3.4.3
@@ -3944,6 +3989,8 @@ snapshots:
 
   jiti@2.7.0: {}
 
+  jose@6.2.11: {}
+
   joycon@3.1.1: {}
 
   json-buffer@3.0.1: {}
@@ -4546,6 +4593,8 @@ snapshots:
     optionalDependencies:
       fsevents: 2.3.3
 
+  tunnel@0.0.6: {}
+
   type-check@0.4.0:
     dependencies:
       prelude-ls: 1.2.1
@@ -4566,6 +4615,8 @@ snapshots:
   ufo@1.6.4: {}
 
   undici-types@7.18.2: {}
+
+  undici@6.28.0: {}
 
   update-browserslist-db@1.2.3(browserslist@4.28.4):
     dependencies:

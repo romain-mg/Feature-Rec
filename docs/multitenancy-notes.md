@@ -1,5 +1,29 @@
 # Multitenancy Notes
 
+## Current contract after deploy B
+
+The singleton designs below are historical and are superseded by the
+[OIDC and multitenancy plan](plans/feature-rec-oidc-multitenancy-plan.md).
+Tenants are UUID product boundaries, each with one GitHub account/installation and one Slack workspace.
+All runner calls verify GitHub OIDC, resolve the enabled tenant, and mint a live repository-scoped
+installation token. Cycles, locks, supersession, and guarded transitions use tenant/repository IDs.
+Repository names are transient GitHub coordinates, with legacy compatibility writes retained only
+for B's qualified singleton rollback window.
+
+Every Slack Web API operation uses the token decrypted from the selected workspace row. Signed
+workspace IDs have no global fallback, and approval payloads must match the cycle tenant's workspace.
+The persisted bot user ID is refreshed by provisioning `auth.test`; normal membership events compare
+it before decrypting or calling Slack. `slack_workspaces.selected_channel_id` owns routing. B keeps
+legacy route dual writes, but does not read legacy rows as runtime authority. Lifecycle deletion
+explicitly removes team settings and disables the tenant even before the later cascade migration.
+
+The A/B/C/D release boundaries remain separate: expand, cut over, enforce/stop legacy writes, then
+contract. B registers no migration beyond `0008`. Later schema rollback must run the newer artifact's
+targeted down migration before starting the older artifact. B-to-A is limited to a validated
+singleton or a pre-cutover restore. See the [cutover and rollback runbook](setup-and-operations.md#oidc-cutover-checklist).
+
+## Historical singleton notes
+
 Single-workspace assumptions currently baked into the service, recorded so the
 multitenant redesign revisits them deliberately.
 

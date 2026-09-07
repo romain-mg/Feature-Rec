@@ -449,7 +449,7 @@ the effective audience.
 
 ### 7. Documentation
 
-- Update `docs/feature-rec.md` and the relevant README summary.
+- Update `docs/setup-and-operations.md` and the relevant README summary.
 - Leave older implementation-plan documents as historical records.
 
 ## Test Matrix

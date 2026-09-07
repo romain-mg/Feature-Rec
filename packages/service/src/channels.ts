@@ -11,10 +11,10 @@ export class ChannelResolutionError extends Error {}
 // Resolved at post time from the explicit workspace route and a transient live
 // membership poll. Slack membership snapshots are never persisted.
 export async function resolveChannel(
-  store: CycleStore,
+  store: Pick<CycleStore, "getSelectedChannelId" | "initializeTeamChannelRoute">,
   slack: SlackClient,
+  teamId: string,
 ): Promise<{ teamId: string; channelId: string; initializedRoute: boolean }> {
-  const { teamId } = await slack.botIdentity();
   const channelIds = await slack.listBotChannels();
   const selectedChannelId = await store.getSelectedChannelId(teamId);
 

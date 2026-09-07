@@ -9,8 +9,8 @@ export interface ReviewCyclesTable {
   tenant_id: ColumnType<string | null, string | null | undefined, string | null>;
   repository_id: ColumnType<
     string | null,
-    string | number | null | undefined,
-    string | number | null
+    string | null | undefined,
+    string | null
   >;
   pr_number: number;
   pr_author: string;
@@ -64,9 +64,9 @@ export interface SlackWorkspacesTable {
 }
 
 export interface GitHubInstallationsTable {
-  installation_id: ColumnType<string, string | number, string | number>;
+  installation_id: string;
   tenant_id: string;
-  github_account_id: ColumnType<string, string | number, string | number>;
+  github_account_id: string;
 }
 
 export interface DB {

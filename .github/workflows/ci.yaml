@@ -64,8 +64,7 @@ jobs:
         run: |
           docker run --detach --name feature-rec-service-ci --network host \
             --env DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-            --env FEATURE_REC_BASE_URL=http://127.0.0.1:3000 \
-            --env FEATURE_REC_RUNNER_TOKEN=ci-smoke-test \
+            --env FEATURE_REC_BASE_URL=https://feature-rec-ci.example \
             --env FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
             --env GITHUB_OIDC_ISSUER=https://token.actions.githubusercontent.com \
             feature-rec-service:ci

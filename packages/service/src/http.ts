@@ -1,5 +1,4 @@
-import Fastify from "fastify";
-import crypto from "node:crypto";
+import Fastify, { type FastifyRequest } from "fastify";
 import {
   buildCycleKey,
   ClassifierResultSchema,
@@ -20,11 +19,13 @@ import {
   joinList,
 } from "./channel-settings";
 import { ChannelResolutionError, resolveChannel } from "./channels";
-import { GitHubClient } from "./github";
+import { GitHubClient, GitHubAuthorizationError, GitHubRequestError, type RepositoryAccess } from "./github";
+import { GitHubOidcVerifier, OidcAuthenticationError, OidcProviderError, type RunnerIdentity, type RunnerIdentityVerifier } from "./oidc";
+import { SlackResolver } from "./slack-resolver";
 import { withRetry } from "./retry";
-import { SlackClient, verifySlackSignature } from "./slack";
+import { SlackClient, isRevokedSlackToken, respondEphemeral, verifySlackSignature } from "./slack";
 import type { SlackUsergroup } from "./slack";
-import { DEFAULT_CHANNEL_SETTINGS, type CycleRecord, type CycleStore } from "./storage";
+import { SlackWorkspaceUnavailableError, type CycleRecord, type CycleStore } from "./storage";
 
 const VIDEO_BODY_LIMIT_BYTES = 500 * 1024 * 1024;
 
@@ -74,6 +75,21 @@ const CHANNEL_MENTION_RE = /^<#([CG][A-Z0-9]+)(?:\|[^>]*)?>$/;
 // A user-correctable command mistake: the message goes back ephemerally
 // instead of becoming a 500.
 class CommandError extends Error {}
+class ApprovalError extends Error {}
+
+function retryAuthorization(error: unknown): boolean {
+  // Do not hammer a rate-limited provider: longer waits are returned to the
+  // caller rather than sleeping inside a request (especially a Slack ack).
+  return error instanceof OidcProviderError || (error instanceof GitHubRequestError && error.retryable && !error.retryAfterSeconds);
+}
+
+function approvalFailureMessage(error: unknown): string {
+  if (error instanceof ApprovalError) return error.message;
+  if (error instanceof GitHubAuthorizationError) {
+    return "Feature-Rec no longer has access to this repository. Ask an administrator to restore the GitHub App installation, then try again.";
+  }
+  return "Feature-Rec could not verify approval access. Please try again; if this continues, ask an administrator to check the integration.";
+}
 
 const GENERAL_HELP = [
   "Feature-Rec commands:",
@@ -114,15 +130,6 @@ function rawJsonBody(body: unknown): string {
   return "";
 }
 
-function timingSafeStringEqual(left: string, right: string): boolean {
-  const leftBytes = Buffer.from(left);
-  const rightBytes = Buffer.from(right);
-  return (
-    leftBytes.byteLength === rightBytes.byteLength &&
-    crypto.timingSafeEqual(leftBytes, rightBytes)
-  );
-}
-
 function classifierSummary(raw: unknown): string {
   const result = ClassifierResultSchema.safeParse(raw);
   if (!result.success) return "";
@@ -134,11 +141,6 @@ function classifierSummary(raw: unknown): string {
   ]
     .filter(Boolean)
     .join("\n");
-}
-
-function runnerAuthorized(env: ServiceEnv, header: unknown): boolean {
-  if (!env.runnerToken || typeof header !== "string") return false;
-  return timingSafeStringEqual(header, `Bearer ${env.runnerToken}`);
 }
 
 function bodyAttemptId(body: unknown): string | undefined {
@@ -157,13 +159,90 @@ export function buildServer(input: {
   env: ServiceEnv;
   store: CycleStore;
   github?: GitHubClient;
-  slack?: SlackClient;
+  oidc?: RunnerIdentityVerifier;
+  slackClientFactory?: (token: string) => SlackClient;
+  respondEphemeral?: typeof respondEphemeral;
 }) {
   const env = input.env;
   const store = input.store;
   const github = input.github ?? new GitHubClient(env);
-  const slack = input.slack ?? new SlackClient(env);
+  const oidc = input.oidc ?? new GitHubOidcVerifier(env);
+  const slackResolver = new SlackResolver(store, env.slackTokenEncryptionKey, input.slackClientFactory);
+  const ephemeral = input.respondEphemeral ?? respondEphemeral;
   const app = Fastify({ logger: true });
+
+  const runnerIdentities = new WeakMap<FastifyRequest, RunnerIdentity>();
+  async function authenticateRunner(request: FastifyRequest): Promise<void> {
+    // Verify at arrival, before body parsing/buffering. A valid token must not
+    // expire merely because an authenticated video upload takes several minutes.
+    const identity = await withRetry(() => oidc.verify(request.headers.authorization), 3, 200, retryAuthorization);
+    runnerIdentities.set(request, identity);
+  }
+
+  // Use the verified runner identity to authorize its tenant/cycle and obtain
+  // repository-scoped GitHub App access. Request bodies never supply authority.
+  async function authorizeRunnerAndGetRepositoryAccess(request: FastifyRequest, cycleId?: string) {
+    const identity = runnerIdentities.get(request);
+    if (!identity) throw new OidcAuthenticationError();
+    if (!/^[0-9]+$/.test(identity.repositoryOwnerId) || BigInt(identity.repositoryOwnerId) > 9223372036854775807n) {
+      throw new GitHubAuthorizationError();
+    }
+    const installation = await store.getEnabledGitHubInstallationByAccountId(identity.repositoryOwnerId);
+    if (!installation) throw new GitHubAuthorizationError();
+    if (cycleId) {
+      const cycle = await store.getCycle(cycleId);
+      if (!cycle || cycle.tenantId !== installation.tenantId || cycle.repositoryId !== identity.repositoryId) {
+        throw new GitHubAuthorizationError();
+      }
+    }
+    const access = await withRetry(() => github.authorizeRepository(installation.installationId, identity.repositoryId), 3, 200, retryAuthorization);
+    if (access.repositoryId !== identity.repositoryId || access.repositoryOwnerId !== identity.repositoryOwnerId) {
+      throw new GitHubAuthorizationError();
+    }
+    request.log.info({
+      category: "runner_authorized", tenantId: installation.tenantId,
+      repositoryId: identity.repositoryId, githubAccountId: installation.githubAccountId,
+      installationId: installation.installationId,
+    }, "Runner repository authorized");
+    return { tenantId: installation.tenantId, repositoryId: identity.repositoryId, access };
+  }
+
+  // Provider failures remain retryable even if access-token creation succeeded
+  // and a later PR/check request failed. Never return tenant/provider details.
+  app.setErrorHandler((error, request, reply) => {
+    if (error instanceof OidcAuthenticationError) {
+      request.log.warn({ category: "oidc_invalid", reason: error.reason }, "Runner authentication rejected");
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+    if (error instanceof OidcProviderError || (error instanceof GitHubRequestError && error.retryable)) {
+      request.log.warn({ category: error instanceof OidcProviderError ? "oidc_unavailable" : "github_unavailable" }, "Provider temporarily unavailable");
+      return reply.header("retry-after", String(error instanceof GitHubRequestError ? Math.max(10, error.retryAfterSeconds ?? 0) : 10)).code(503).send({ error: "authorization_temporarily_unavailable" });
+    }
+    if (error instanceof GitHubAuthorizationError) {
+      request.log.warn({ category: "repository_forbidden" }, "Repository authorization rejected");
+      return reply.code(403).send({ error: "forbidden" });
+    }
+    if (error instanceof GitHubRequestError) {
+      request.log.error({ category: "github_request_failed", status: error.status }, "GitHub integration request failed");
+      return reply.code(502).send({ error: "github_request_failed" });
+    }
+    return reply.send(error);
+  });
+
+  async function authorizeCycle(cycle: CycleRecord): Promise<RepositoryAccess> {
+    const installation = await store.getGitHubInstallationByTenantId(cycle.tenantId);
+    if (!installation?.enabled) throw new GitHubAuthorizationError();
+    const access = await withRetry(() => github.authorizeRepository(installation.installationId, cycle.repositoryId), 3, 200, retryAuthorization);
+    if (access.repositoryId !== cycle.repositoryId || access.repositoryOwnerId !== installation.githubAccountId) {
+      throw new GitHubAuthorizationError();
+    }
+    return access;
+  }
+
+  async function finalizeCycle(cycle: CycleRecord, state: "superseded", detail: string): Promise<void> {
+    const resolvedSlack = await slackResolver.forTenant(cycle.tenantId);
+    if (resolvedSlack) await withRetry(() => resolvedSlack.client.finalize(cycle, state, detail));
+  }
 
   app.removeContentTypeParser("application/json");
   app.addContentTypeParser(
@@ -200,13 +279,21 @@ export function buildServer(input: {
 
   app.get("/health", async () => ({ ok: true }));
 
-  app.post("/api/runs/start", async (request, reply) => {
-    if (!runnerAuthorized(env, request.headers.authorization)) {
-      return reply.code(401).send({ error: "unauthorized" });
-    }
-    const start = RunStartRequestSchema.parse(request.body);
-    const cycleKey = buildCycleKey(start);
-    const result = await store.startCycle({ ...start, cycleKey });
+  app.post("/api/runs/start", { onRequest: authenticateRunner }, async (request, reply) => {
+    const authorized = await authorizeRunnerAndGetRepositoryAccess(request);
+    const { tenantId, repositoryId, access } = authorized;
+    const parsed = RunStartRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid start request" });
+    const start = parsed.data;
+    const pr = await withRetry(() => github.getPullRequest(access, start.prNumber), 3, 200, retryAuthorization);
+    if (pr.state !== "open") return { skipped: true, reason: "closed" };
+    if (pr.draft) return { skipped: true, reason: "draft" };
+    if (pr.headSha !== start.headSha) return { skipped: true, reason: "stale_head" };
+    const cycleKey = buildCycleKey({ tenantId, repositoryId, ...start });
+    const result = await store.startCycle({
+      ...start, tenantId, repositoryId, cycleKey,
+      prTitle: pr.prTitle, prAuthor: pr.prAuthor, owner: access.owner, repo: access.repo,
+    });
 
     // Duplicate start for the same head: clean no-op exit. No check run is
     // created and no attemptId is issued, so this runner holds no ownership.
@@ -231,11 +318,9 @@ export function buildServer(input: {
                 title: "Feature-Rec: superseded",
                 summary: `Superseded by a newer PR head SHA: ${start.headSha}.`,
               },
-            }),
+            }, access),
           ),
-          withRetry(() =>
-            slack.finalize(oldCycle, "superseded", "A newer commit started a fresh validation cycle."),
-          ),
+          finalizeCycle(oldCycle, "superseded", "A newer commit started a fresh validation cycle."),
         ]);
         if (gh.status === "rejected") {
           request.log.warn(
@@ -262,7 +347,7 @@ export function buildServer(input: {
     // otherwise strand the cycle as `analyzing` with no attemptId returned, and
     // every retry would exit as a duplicate. Unknown → omit the flag and let
     // video-time resolution decide.
-    const onboarded = await tenantHasChannels().catch((err: unknown) => {
+    const onboarded = await tenantHasChannels(tenantId).catch((err: unknown) => {
       request.log.warn({ err }, "advisory onboarding check failed; deferring to video-time resolution");
       return undefined;
     });
@@ -271,15 +356,23 @@ export function buildServer(input: {
     // (set it back to in_progress) instead of creating a second one, so a
     // re-run recovers a red check rather than exiting green over a red run.
     if (result.cycle.checkRunId) {
-      await withRetry(() =>
-        github.updateCheckRun(result.cycle, {
-          status: "in_progress",
-          output: {
-            title: "Feature-Rec: analyzing",
-            summary: "Re-running Feature-Rec after a previous failure.",
-          },
-        }),
-      );
+      try {
+        await withRetry(() =>
+          github.updateCheckRun(result.cycle, {
+            status: "in_progress",
+            output: {
+              title: "Feature-Rec: analyzing",
+              summary: "Re-running Feature-Rec after a previous failure.",
+            },
+          }, access),
+        );
+      } catch (error) {
+        await store.transitionRunnerStatus({
+          tenantId, repositoryId, cycleId: result.cycle.id,
+          attemptId: result.attemptId, from: ["analyzing"], to: "failed",
+        });
+        throw error;
+      }
       return {
         cycleId: result.cycle.id,
         cycleKey,
@@ -294,9 +387,10 @@ export function buildServer(input: {
     // a same-head workflow rerun can take over instead of exiting as a duplicate.
     let checkRunId: number;
     try {
-      checkRunId = await github.createCheckRun({ ...start, cycleKey });
+      checkRunId = await github.createCheckRun({ ...start, cycleKey }, access);
     } catch (err) {
       await store.transitionRunnerStatus({
+        tenantId, repositoryId,
         cycleId: result.cycle.id,
         attemptId: result.attemptId,
         from: ["analyzing"],
@@ -316,15 +410,14 @@ export function buildServer(input: {
       try {
         await withRetry(() =>
           github.updateCheckRun(
-            { owner: start.owner, repo: start.repo, checkRunId },
+            { checkRunId },
             {
               conclusion: "neutral",
               output: {
                 title: "Feature-Rec: superseded",
                 summary: "Superseded by a newer PR head SHA before validation started.",
               },
-            },
-          ),
+            }, access),
         );
       } catch (err) {
         request.log.warn(
@@ -346,22 +439,21 @@ export function buildServer(input: {
   // Whether video delivery could resolve a channel now, without mutating the
   // route. A sole membership is usable through video delivery's missed-event
   // fallback, while join events remain the primary initialization path.
-  async function tenantHasChannels(): Promise<boolean> {
-    const { teamId } = await slack.botIdentity();
-    const channelIds = await slack.listBotChannels();
-    const selectedChannelId = await store.getSelectedChannelId(teamId);
-    return selectedChannelId
-      ? channelIds.includes(selectedChannelId)
-      : channelIds.length === 1;
+  async function tenantHasChannels(tenantId: string): Promise<boolean> {
+    const resolvedSlack = await slackResolver.forTenant(tenantId);
+    if (!resolvedSlack) return false;
+    const channelIds = await resolvedSlack.client.listBotChannels();
+    const selectedChannelId = await store.getSelectedChannelId(resolvedSlack.workspace.teamId);
+    return selectedChannelId ? channelIds.includes(selectedChannelId) : channelIds.length === 1;
   }
 
-  app.post("/api/runs/:cycleId/accepted", async (request, reply) => {
-    if (!runnerAuthorized(env, request.headers.authorization)) {
-      return reply.code(401).send({ error: "unauthorized" });
-    }
+  app.post("/api/runs/:cycleId/accepted", { onRequest: authenticateRunner }, async (request, reply) => {
+    const authorized = await authorizeRunnerAndGetRepositoryAccess(request, param(request.params, "cycleId"));
+    const { tenantId, repositoryId, access } = authorized;
     const attemptId = bodyAttemptId(request.body);
     if (!attemptId) return reply.code(400).send({ error: "attemptId is required" });
     const cycle = await store.transitionRunnerStatus({
+        tenantId, repositoryId,
       cycleId: param(request.params, "cycleId"),
       attemptId,
       from: ["analyzing"],
@@ -375,19 +467,19 @@ export function buildServer(input: {
           title: "Feature-Rec: accepted",
           summary: classifierSummary(request.body) || "No frontend-visible validation needed.",
         },
-      }),
+      }, access),
     );
     return { ok: true };
   });
 
-  app.post("/api/runs/:cycleId/failed", async (request, reply) => {
-    if (!runnerAuthorized(env, request.headers.authorization)) {
-      return reply.code(401).send({ error: "unauthorized" });
-    }
+  app.post("/api/runs/:cycleId/failed", { onRequest: authenticateRunner }, async (request, reply) => {
+    const authorized = await authorizeRunnerAndGetRepositoryAccess(request, param(request.params, "cycleId"));
+    const { tenantId, repositoryId, access } = authorized;
     const body = request.body as { message?: string } | undefined;
     const attemptId = bodyAttemptId(request.body);
     if (!attemptId) return reply.code(400).send({ error: "attemptId is required" });
     const cycle = await store.transitionRunnerStatus({
+        tenantId, repositoryId,
       cycleId: param(request.params, "cycleId"),
       attemptId,
       from: ["analyzing", "pending_validation"],
@@ -401,18 +493,17 @@ export function buildServer(input: {
           title: "Feature-Rec: failed",
           summary: body?.message ?? "Feature-Rec failed.",
         },
-      }),
+      }, access),
     );
     return { ok: true };
   });
 
   app.post(
     "/api/runs/:cycleId/video",
-    { bodyLimit: VIDEO_BODY_LIMIT_BYTES },
+    { onRequest: authenticateRunner, bodyLimit: VIDEO_BODY_LIMIT_BYTES },
     async (request, reply) => {
-      if (!runnerAuthorized(env, request.headers.authorization)) {
-        return reply.code(401).send({ error: "unauthorized" });
-      }
+      const authorized = await authorizeRunnerAndGetRepositoryAccess(request, param(request.params, "cycleId"));
+      const { tenantId, repositoryId, access } = authorized;
       const video = Buffer.isBuffer(request.body) ? request.body : Buffer.from([]);
       if (video.byteLength === 0) return reply.code(400).send({ error: "empty video body" });
       const attemptId = headerAttemptId(request.headers["x-feature-rec-attempt"]);
@@ -421,6 +512,7 @@ export function buildServer(input: {
       // Transition first (guards against stale/duplicate runners and gives
       // first-writer-wins idempotency), then run side effects.
       const cycle = await store.transitionRunnerStatus({
+        tenantId, repositoryId,
         cycleId: param(request.params, "cycleId"),
         attemptId,
         from: ["analyzing"],
@@ -428,89 +520,130 @@ export function buildServer(input: {
       });
       if (!cycle) return reply.send({ ok: false, stale: true });
 
-      // Resolve the review channel before any side effect: with no channel
-      // there is nowhere to post, so fail the cycle with an actionable
-      // check-run message and tell the runner explicitly (settled: true) that
-      // there is nothing left to report. The status guard on /failed remains
-      // as defense-in-depth against races, not as the preservation mechanism.
-      let resolved: {
-        teamId: string;
-        channelId: string;
-        initializedRoute: boolean;
-      };
+      // Once delivery owns the pending cycle, settle any caught failure here.
+      // Recovery must not depend on the runner making another HTTP request.
+      let slackClient: SlackClient | undefined;
+      let slackMessage: { channel: string; ts: string } | undefined;
       try {
-        resolved = await resolveChannel(store, slack);
+        const resolvedSlack = await slackResolver.forTenant(tenantId);
+        if (!resolvedSlack) throw new SlackWorkspaceUnavailableError();
+        slackClient = resolvedSlack.client;
+        const resolved = await resolveChannel(store, slackClient, resolvedSlack.workspace.teamId);
+
+        if (resolved.initializedRoute) {
+          await greetJoinedChannel(resolved.teamId, resolved.channelId, slackClient).catch((err: unknown) => {
+            request.log.warn(
+              { err, teamId: resolved.teamId, channelId: resolved.channelId },
+              "missed-event fallback greeting failed",
+            );
+          });
+        }
+        await withRetry(() =>
+          github.updateCheckRun(cycle, {
+            status: "in_progress",
+            output: {
+              title: "Feature-Rec: pending validation",
+              summary: "Frontend-visible change rendered and sent to Slack for validation.",
+            },
+          }, access),
+        );
+
+        const settings = await withRetry(() =>
+          store.getChannelSettings(resolved.teamId, resolved.channelId),
+        );
+
+        await slackClient.uploadVideo(cycle, resolved.channelId, video, access.fullName);
+        const message = await slackClient.postValidation(
+          cycle,
+          resolved.channelId,
+          effectiveMention(settings),
+          access.fullName,
+        );
+        slackMessage = message;
+        // Persisting the same Slack coordinates is idempotent. Retry so a
+        // transient DB failure does not leave a live validation message untracked.
+        const statusAfter = await withRetry(() =>
+          store.attachSlackMessage(cycle.id, message.channel, message.ts),
+        );
+        if (statusAfter === "superseded") {
+          // Superseded after the transition but before the Slack post landed:
+          // finalize the message we just posted so it can't strand in Slack.
+          // Retried: nobody else will ever repair this message (the superseder's
+          // cleanup already ran and saw no coordinates), and chat.update is idempotent.
+          await withRetry(() =>
+            resolvedSlack.client.finalize(
+              { ...cycle, slackChannelId: message.channel, slackMessageTs: message.ts },
+              "superseded",
+              "A newer commit started a fresh validation cycle.",
+            ),
+          );
+        }
+        return { ok: true, channel: message.channel, ts: message.ts };
       } catch (err) {
-        if (!(err instanceof ChannelResolutionError)) throw err;
+        const unavailable = err instanceof SlackWorkspaceUnavailableError || isRevokedSlackToken(err);
+        const channelError = err instanceof ChannelResolutionError;
+        request.log.warn({ err, cycleId: cycle.id, tenantId, repositoryId }, "Video delivery failed");
+        const message = unavailable
+          ? "The Slack workspace was uninstalled or its token was revoked during delivery. Restore the Slack integration and rerun Feature-Rec."
+          : channelError
+            ? err.message
+            : "Feature-Rec could not complete video delivery. Rerun the workflow; if this continues, ask an administrator to check the service logs.";
         const failed = await store.transitionRunnerStatus({
+          tenantId, repositoryId,
           cycleId: cycle.id,
           attemptId,
           from: ["pending_validation"],
           to: "failed",
         });
-        // Superseded while resolving: the superseder already neutralized the
-        // check run — don't clobber its conclusion with a failure.
-        if (!failed) return reply.send({ ok: false, stale: true });
-        await withRetry(() =>
-          github.updateCheckRun(cycle, {
-            conclusion: "failure",
-            output: {
-              title: "Feature-Rec: no Slack review channel",
-              summary: err.message,
-            },
-          }),
-        );
+        // A concurrent approval, supersession, or new attempt owns its result.
+        // A superseder may have seen no coordinates if attachment failed, so
+        // repair our known post without overwriting another decision's message.
+        if (!failed) {
+          if (slackClient && slackMessage) {
+            const client = slackClient;
+            const postedCycle = { ...cycle, slackChannelId: slackMessage.channel, slackMessageTs: slackMessage.ts };
+            await settleSideEffects(cycle.id, [["slack superseded delivery", withRetry(async () => {
+              const current = await store.getCycle(cycle.id);
+              if (current?.status === "superseded") {
+                await client.finalize(postedCycle, "superseded", "A newer commit started a fresh validation cycle.");
+              }
+            })]]);
+          }
+          return reply.send({ ok: false, stale: true });
+        }
+        // Slack delivery may outlive the token issued when the request arrived.
+        // Reauthorize this stored cycle before repairing GitHub; Slack cleanup
+        // must still run if that fresh grant cannot be obtained.
+        const effects: Array<[string, Promise<unknown>]> = [
+          ["github delivery failure", authorizeCycle(failed).then((failureAccess) =>
+            withRetry(() =>
+              github.updateCheckRun(failed, {
+                conclusion: "failure",
+                output: {
+                  title: unavailable
+                    ? "Feature-Rec: Slack integration unavailable"
+                    : channelError ? "Feature-Rec: no Slack review channel" : "Feature-Rec: video delivery failed",
+                  summary: message,
+                },
+              }, failureAccess),
+            ),
+          )],
+        ];
+        if (slackClient && slackMessage) {
+          const client = slackClient;
+          const postedCycle = { ...failed, slackChannelId: slackMessage.channel, slackMessageTs: slackMessage.ts };
+          effects.push(["slack delivery failure", withRetry(() => client.finalize(postedCycle, "failed", message))]);
+        }
+        await settleSideEffects(failed.id, effects);
+        if (err instanceof GitHubRequestError && err.retryable) {
+          reply.header("retry-after", String(Math.max(10, err.retryAfterSeconds ?? 0)));
+        }
+        // settled describes the committed cycle. Provider repair can fail;
+        // a workflow rerun can now take over this failed cycle and retry it.
         return reply
-          .code(422)
-          .send({ ok: false, error: "no_slack_channel", message: err.message, settled: true });
+          .code(unavailable || channelError ? 422 : err instanceof GitHubRequestError ? (err.retryable ? 503 : 502) : 500)
+          .send({ ok: false, error: unavailable ? "slack_unavailable" : channelError ? "no_slack_channel" : "video_delivery_failed", message, settled: true });
       }
-      if (resolved.initializedRoute) {
-        await greetJoinedChannel(resolved.teamId, resolved.channelId).catch((err: unknown) => {
-          request.log.warn(
-            { err, teamId: resolved.teamId, channelId: resolved.channelId },
-            "missed-event fallback greeting failed",
-          );
-        });
-      }
-      await withRetry(() =>
-        github.updateCheckRun(cycle, {
-          status: "in_progress",
-          output: {
-            title: "Feature-Rec: pending validation",
-            summary: "Frontend-visible change rendered and sent to Slack for validation.",
-          },
-        }),
-      );
-
-      const settings = await withRetry(() =>
-        store.getChannelSettings(resolved.teamId, resolved.channelId),
-      );
-
-      await slack.uploadVideo(cycle, resolved.channelId, video);
-      const message = await slack.postValidation(
-        cycle,
-        resolved.channelId,
-        effectiveMention(settings),
-      );
-      // Persisting the same Slack coordinates is idempotent. Retry so a
-      // transient DB failure does not leave a live validation message untracked.
-      const statusAfter = await withRetry(() =>
-        store.attachSlackMessage(cycle.id, message.channel, message.ts),
-      );
-      if (statusAfter === "superseded") {
-        // Superseded after the transition but before the Slack post landed:
-        // finalize the message we just posted so it can't strand in Slack.
-        // Retried: nobody else will ever repair this message (the superseder's
-        // cleanup already ran and saw no coordinates), and chat.update is idempotent.
-        await withRetry(() =>
-          slack.finalize(
-            { ...cycle, slackChannelId: message.channel, slackMessageTs: message.ts },
-            "superseded",
-            "A newer commit started a fresh validation cycle.",
-          ),
-        );
-      }
-      return { ok: true, channel: message.channel, ts: message.ts };
     },
   );
 
@@ -539,8 +672,22 @@ export function buildServer(input: {
           errors: { comment: "Please describe what needs to change." },
         });
       }
-      void handleViewSubmission(payload, comment).catch((err) => app.log.error(err));
-      return reply.send("");
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const prepared = await Promise.race([
+          prepareViewSubmission(payload),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new ApprovalError("Approval access checks are taking too long. Your comment is preserved; please try again.")), 2_000);
+          }),
+        ]);
+        void handleViewSubmission(prepared, comment).catch((err) => app.log.error(err));
+        return reply.send("");
+      } catch (error) {
+        app.log.warn({ err: error, teamId: payload.team?.id, viewId: payload.view?.id }, "Slack approval preparation failed");
+        return reply.send({ response_action: "errors", errors: { comment: approvalFailureMessage(error) } });
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
     return reply.send("");
@@ -559,24 +706,49 @@ export function buildServer(input: {
     if (body.type === "url_verification") return reply.send({ challenge: body.challenge ?? "" });
     if (body.type !== "event_callback") return reply.send({ ok: true });
 
-    // Drop everything that isn't a bot join, without logging it:
-    // membership events fire for every user entering a bot channel and their
-    // payloads must never reach the logs.
     const event = body.event ?? {};
-    const isJoin = event.type === "member_joined_channel";
-    if (!isJoin || !event.user || !event.channel) return reply.send({ ok: true });
-    const identity = await slack.botIdentity();
-    if (event.user !== identity.userId) return reply.send({ ok: true });
-
-    const teamId = body.team_id ?? identity.teamId;
-    if (teamId !== identity.teamId) return reply.send({ ok: true });
+    const teamId = body.team_id;
+    if (!teamId) return reply.send({ ok: true });
+    if (event.type === "app_uninstalled" || event.type === "tokens_revoked") {
+      const workspace = await store.getSlackWorkspaceByTeamId(teamId);
+      if (!workspace) return reply.send({ ok: true });
+      try {
+        if (!(await slackResolver.tokenIsRevoked(workspace))) {
+          request.log.info({ category: "slack_lifecycle_stale", teamId }, "Lifecycle event does not revoke the current Slack credential");
+          return reply.send({ ok: true });
+        }
+      } catch (err) {
+        // The resolver strips provider and decryption details before throwing.
+        request.log.warn({ err, category: "slack_lifecycle_unverified", teamId }, "Slack lifecycle cleanup could not verify current credentials");
+        return reply.header("retry-after", "10").code(503).send({ error: "slack_lifecycle_temporarily_unavailable" });
+      }
+      try {
+        await store.deleteSlackWorkspace(teamId, workspace.botTokenCiphertext);
+      } catch (err) {
+        // Database errors can contain SQL values; retain only a diagnostic code,
+        // never transaction details that could include the checked ciphertext.
+        const code = err && typeof err === "object" && "code" in err ? err.code : undefined;
+        request.log.warn({
+          category: "slack_lifecycle_cleanup_failed", teamId,
+          errorCode: typeof code === "string" && /^[A-Z0-9_]{1,40}$/.test(code) ? code : undefined,
+        }, "Slack lifecycle workspace deletion failed");
+        return reply.header("retry-after", "10").code(503).send({ error: "slack_lifecycle_temporarily_unavailable" });
+      }
+      return reply.send({ ok: true });
+    }
+    if (event.type !== "member_joined_channel" || !event.user || !event.channel) return reply.send({ ok: true });
+    // Filter human joins from signed team metadata before decrypting credentials.
+    const workspace = await slackResolver.workspaceForTeam(teamId);
+    if (!workspace || event.user !== workspace.botUserId) return reply.send({ ok: true });
     const channelId = event.channel;
 
     // The first observed join wins under the per-team route lock. Later joins
     // are deliberately silent and do not persist membership state.
     const initialized = await store.initializeTeamChannelRoute({ teamId, channelId });
     if (initialized.initializedRoute && (await isFirstEventDelivery(body.event_id))) {
-      void greetJoinedChannel(teamId, channelId).catch((err) => app.log.error(err));
+      void (async () => {
+        await greetJoinedChannel(teamId, channelId, slackResolver.forWorkspace(workspace));
+      })().catch((err: unknown) => app.log.error({ err, teamId, channelId }, "Slack greeting failed"));
     }
     return reply.send({ ok: true });
   });
@@ -626,14 +798,10 @@ export function buildServer(input: {
   }): Promise<void> {
     let text: string;
     try {
-      const [identity, botChannelIds] = await Promise.all([
-        slack.botIdentity(),
-        slack.listBotChannels(),
-      ]);
-      if (identity.teamId !== input.teamId) {
-        throw new CommandError("This command belongs to a different Slack workspace.");
-      }
-      const context = { ...input, botChannelIds };
+      const resolvedSlack = await slackResolver.forTeam(input.teamId);
+      if (!resolvedSlack) throw new CommandError("Feature-Rec is not enabled for this Slack workspace.");
+      const botChannelIds = await resolvedSlack.client.listBotChannels();
+      const context = { ...input, botChannelIds, slack: resolvedSlack.client };
       if (input.subcommand === "channel") {
         text = await channelCommand(context);
       } else if (input.subcommand === "mention") {
@@ -658,7 +826,7 @@ export function buildServer(input: {
       }
     }
 
-    await slack.respondEphemeral(input.responseUrl, text).catch((err: unknown) => {
+    await ephemeral(input.responseUrl, text).catch((err: unknown) => {
       app.log.warn(
         { err, teamId: input.teamId, channelId: input.channelId },
         "Slack command ephemeral reply failed",
@@ -672,6 +840,7 @@ export function buildServer(input: {
     userId: string;
     args: string[];
     botChannelIds: string[];
+    slack: SlackClient;
   };
 
   async function channelCommand(input: CommandContext): Promise<string> {
@@ -793,8 +962,8 @@ export function buildServer(input: {
       throw new CommandError("Use @channel by itself: `/feature-rec mention @channel`.");
     }
 
-    const targets = await resolveTargets(input.args, "mention");
-    await validateTargetMembership(channelId, targets.concreteUserIds, "mentions");
+    const targets = await resolveTargets(input.slack, input.args, "mention");
+    await validateTargetMembership(input.slack, channelId, targets.concreteUserIds, "mentions");
     const audience = targets.rendered.join(" ");
     const written = await store.setSelectedChannelMentionSetting({
       teamId: input.teamId,
@@ -842,8 +1011,8 @@ export function buildServer(input: {
         `Everyone in <#${channelId}> can now approve.`,
       );
     }
-    const targets = await resolveTargets(input.args, "approver");
-    await validateTargetMembership(channelId, targets.concreteUserIds, "approvers");
+    const targets = await resolveTargets(input.slack, input.args, "approver");
+    await validateTargetMembership(input.slack, channelId, targets.concreteUserIds, "approvers");
     const written = await store.setSelectedChannelApprovers({
       teamId: input.teamId,
       expectedChannelId: channelId,
@@ -859,6 +1028,7 @@ export function buildServer(input: {
   }
 
   async function resolveTargets(
+    slack: SlackClient,
     tokens: string[],
     kind: "mention" | "approver",
   ): Promise<{ rendered: string[]; storedIds: string[]; concreteUserIds: string[] }> {
@@ -913,6 +1083,7 @@ export function buildServer(input: {
   }
 
   async function validateTargetMembership(
+    slack: SlackClient,
     channelId: string,
     userIds: string[],
     setting: "mentions" | "approvers",
@@ -950,9 +1121,7 @@ export function buildServer(input: {
     return lines.join("\n");
   }
 
-  async function greetJoinedChannel(teamId: string, channelId: string): Promise<void> {
-    const identity = await slack.botIdentity();
-    if (identity.teamId !== teamId) return;
+  async function greetJoinedChannel(teamId: string, channelId: string, slack: SlackClient): Promise<void> {
     const memberships = await slack.listBotChannels();
     const selectedChannelId = await store.getSelectedChannelId(teamId);
     if (selectedChannelId !== channelId || !memberships.includes(channelId)) return;
@@ -967,13 +1136,21 @@ export function buildServer(input: {
     payload: SlackPayload,
     cycle: CycleRecord,
     responseUrl: string | undefined,
-  ): Promise<boolean> {
-    const teamId = payload.team?.id ?? (await slack.botIdentity()).teamId;
-    const settings = cycle.slackChannelId
-      ? await store.getChannelSettings(teamId, cycle.slackChannelId)
-      : DEFAULT_CHANNEL_SETTINGS;
+  ): Promise<{ slack: SlackClient; tenantId: string } | null> {
+    const teamId = payload.team?.id;
+    if (!teamId || !payload.user?.id || !cycle.slackChannelId) {
+      app.log.warn({ category: "slack_approval_context_missing", cycleId: cycle.id, teamId }, "Slack approval rejected");
+      return null;
+    }
+    const workspace = await slackResolver.workspaceForTeam(teamId);
+    if (!workspace || workspace.tenantId !== cycle.tenantId) {
+      app.log.warn({ category: workspace ? "slack_approval_tenant_mismatch" : "slack_approval_workspace_unavailable", cycleId: cycle.id, teamId }, "Slack approval rejected");
+      return null;
+    }
+    const slack = slackResolver.forWorkspace(workspace);
+    const settings = await store.getChannelSettings(teamId, cycle.slackChannelId);
     const approvers = settings.approvers;
-    if (await slack.isApprover(approvers, payload.user?.id)) return true;
+    if (await slack.isApprover(approvers, payload.user?.id)) return { slack, tenantId: workspace.tenantId };
     app.log.warn({ cycleId: cycle.id, slackUserId: payload.user?.id }, "unauthorized Slack approver");
     if (responseUrl && approvers) {
       // Best-effort: a modal can outlive its stashed response_url (30 min),
@@ -987,7 +1164,7 @@ export function buildServer(input: {
           app.log.warn({ err, cycleId: cycle.id }, "unauthorized-approver ephemeral reply failed"),
         );
     }
-    return false;
+    return null;
   }
 
   async function handleBlockAction(payload: SlackPayload): Promise<void> {
@@ -996,14 +1173,28 @@ export function buildServer(input: {
     const interactionId = `block:${payload.trigger_id ?? ""}:${action?.action_ts ?? ""}:${value.action}`;
 
     const cycle = await store.getCycle(value.cycleId);
-    if (!cycle) return;
-    if (!(await approvalGate(payload, cycle, payload.response_url))) return;
+    if (!cycle || cycle.headSha !== value.headSha || cycle.status !== "pending_validation") return;
+    const authorizedSlack = await approvalGate(payload, cycle, payload.response_url);
+    if (!authorizedSlack) return;
+    const { slack, tenantId } = authorizedSlack;
+    let access: RepositoryAccess | null;
+    try {
+      access = value.action === "accept" ? await authorizeCycle(cycle) : null;
+    } catch (error) {
+      app.log.warn({ err: error, cycleId: cycle.id, tenantId }, "Slack approval GitHub authorization failed");
+      if (payload.response_url) {
+        await ephemeral(payload.response_url, approvalFailureMessage(error)).catch((err: unknown) =>
+          app.log.warn({ err, cycleId: cycle.id }, "Slack approval failure reply failed"));
+      }
+      return;
+    }
     if (!(await store.recordProcessedInteraction(interactionId, value.cycleId))) return;
 
-    if (value.action === "accept") {
+    if (value.action === "accept" && access) {
       // Transition-first: two distinct clicks both pass dedupe, so the status
       // guard is what serializes them. Stop on null (stale or lost the race).
       const accepted = await store.transitionSlackStatus({
+        tenantId,
         cycleId: cycle.id,
         from: ["pending_validation"],
         to: "accepted",
@@ -1015,7 +1206,7 @@ export function buildServer(input: {
       // cycle, so a GitHub failure must not skip the Slack finalize (live
       // buttons on a decided cycle), nor vice versa.
       await settleSideEffects(accepted.id, [
-        ["github accept", github.accept(accepted)],
+        ["github accept", github.accept(accepted, access)],
         ["slack finalize", withRetry(() => slack.finalize(accepted, "accepted", "Validation passed."))],
       ]);
       return;
@@ -1026,7 +1217,7 @@ export function buildServer(input: {
     }
   }
 
-  async function handleViewSubmission(payload: SlackPayload, comment: string): Promise<void> {
+  async function prepareViewSubmission(payload: SlackPayload) {
     const meta = JSON.parse(payload.view?.private_metadata ?? "{}") as {
       cycleId?: string;
       headSha?: string;
@@ -1035,11 +1226,20 @@ export function buildServer(input: {
     const cycleId = meta.cycleId ?? "";
     const interactionId = `view:${payload.view?.id ?? ""}:${payload.view?.hash ?? ""}`;
     const cycle = await store.getCycle(cycleId);
-    if (!cycle) return;
-    if (!(await approvalGate(payload, cycle, meta.responseUrl))) return;
-    if (!(await store.recordProcessedInteraction(interactionId, cycleId))) return;
+    if (!cycle || cycle.headSha !== meta.headSha || cycle.status !== "pending_validation") {
+      throw new ApprovalError("This review is no longer pending. Close this dialog and use the latest validation message.");
+    }
+    const authorizedSlack = await approvalGate(payload, cycle, meta.responseUrl);
+    if (!authorizedSlack) throw new ApprovalError("You cannot approve this review from this workspace. Ask an administrator to check the integration and channel approvers.");
+    const access = await authorizeCycle(cycle);
+    return { cycle, ...authorizedSlack, access, interactionId };
+  }
 
+  async function handleViewSubmission(prepared: Awaited<ReturnType<typeof prepareViewSubmission>>, comment: string): Promise<void> {
+    const { cycle, slack, tenantId, access, interactionId } = prepared;
+    if (!(await store.recordProcessedInteraction(interactionId, cycle.id))) return;
     const rejected = await store.transitionSlackStatus({
+      tenantId,
       cycleId: cycle.id,
       from: ["pending_validation"],
       to: "rejected",
@@ -1049,7 +1249,7 @@ export function buildServer(input: {
     // PATCH retries internally (see GitHubClient.reject). GitHub and Slack
     // effects run independently (see accept path for rationale).
     await settleSideEffects(rejected.id, [
-      ["github reject", github.reject(rejected, comment.trim())],
+      ["github reject", github.reject(rejected, comment.trim(), access)],
       ["slack finalize", withRetry(() => slack.finalize(rejected, "rejected", comment.trim()))],
     ]);
   }

@@ -1,5 +1,4 @@
 import crypto from "node:crypto";
-import type { RunStartRequest } from "@feature-rec/core";
 import {
   GITHUB_ACCEPT_COMMENT,
   GITHUB_CHECK_NAME,
@@ -33,6 +32,31 @@ export type GitHubRepositoryIdentity = GitHubInstallation & {
   repo: string;
   fullName: string;
 };
+
+export type RepositoryAccess = {
+  token: string;
+  repositoryId: string;
+  repositoryOwnerId: string;
+  owner: string;
+  repo: string;
+  fullName: string;
+};
+
+export type GitHubPullRequest = {
+  state: "open" | "closed";
+  draft: boolean;
+  headSha: string;
+  prTitle: string;
+  prAuthor: string;
+};
+
+export class GitHubAuthorizationError extends Error {
+  constructor() { super("Repository access denied"); }
+}
+
+function repositoryPath(access: RepositoryAccess): string {
+  return `/repos/${encodeURIComponent(access.owner)}/${encodeURIComponent(access.repo)}`;
+}
 
 function b64url(input: string | Buffer): string {
   return Buffer.from(input)
@@ -77,7 +101,11 @@ function safeIdNumber(value: string, label: string): number {
 }
 
 export class GitHubRequestError extends Error {
-  constructor(readonly status: number | null, readonly retryable = status === null || status === 429 || (status >= 500 && status <= 599)) {
+  constructor(
+    readonly status: number | null,
+    readonly retryable = status === null || status === 429 || (status >= 500 && status <= 599),
+    readonly retryAfterSeconds: number | null = null,
+  ) {
     super(status === null
       ? "GitHub network request failed (retryable)"
       : `GitHub API request failed: HTTP ${status} (${retryable ? "retryable; retry after GitHub recovers or its rate limit resets" : "check App permissions, installation and repository access"})`);
@@ -95,6 +123,7 @@ async function githubFetch<T>(
 ): Promise<T> {
   const response = await fetch(`https://api.github.com${path}`, {
     method: opts.method ?? "GET",
+    signal: AbortSignal.timeout(5_000),
     headers: {
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${opts.token}`,
@@ -107,14 +136,24 @@ async function githubFetch<T>(
     const rateLimited = response.status === 403 && (response.headers.get("x-ratelimit-remaining") === "0" || response.headers.has("retry-after"));
     // Never include response bodies or request headers: they may contain credentials.
     await response.body?.cancel().catch(() => undefined);
-    throw new GitHubRequestError(response.status, rateLimited || response.status === 429 || response.status >= 500);
+    const retryAfter = response.headers.get("retry-after");
+    const reset = response.headers.get("x-ratelimit-reset");
+    const retrySeconds = retryAfter !== null
+      ? (/^\d+$/.test(retryAfter) ? Number(retryAfter) : (Date.parse(retryAfter) - Date.now()) / 1_000)
+      : response.headers.get("x-ratelimit-remaining") === "0" && reset !== null ? Number(reset) - Date.now() / 1_000 : NaN;
+    throw new GitHubRequestError(response.status, rateLimited || response.status === 429 || response.status >= 500,
+      Number.isFinite(retrySeconds) ? Math.max(0, Math.ceil(retrySeconds)) : null);
   }
-  return (await response.json()) as T;
+  try {
+    return (await response.json()) as T;
+  } catch {
+    // JSON parsing errors may quote the response body, including access tokens.
+    throw new GitHubRequestError(null);
+  }
 }
 
 export class GitHubClient {
   #env: ServiceEnv;
-  #installationTokens = new Map<string, { token: string; expiresAt: number }>();
 
   constructor(env: ServiceEnv) {
     this.#env = env;
@@ -200,33 +239,69 @@ export class GitHubClient {
     return repository;
   }
 
-  async tokenForRepo(owner: string, repo: string): Promise<string> {
-    if (this.#env.githubToken) return this.#env.githubToken;
-    const cacheKey = `${owner}/${repo}`;
-    const cached = this.#installationTokens.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now() + 60_000) return cached.token;
-
-    const jwt = appJwt(this.#env);
-    const installation = await githubFetch<{ id: number }>(`/repos/${owner}/${repo}/installation`, {
-      token: jwt,
+  // Mint scoped access for each logical operation so both permission checks and
+  // repository coordinates come from the current installation grant.
+  async authorizeRepository(installationId: string, repositoryId: string): Promise<RepositoryAccess> {
+    let id: number;
+    try {
+      id = safeIdNumber(repositoryId, "GitHub repository ID");
+      safeIdNumber(installationId, "GitHub installation ID");
+    } catch {
+      throw new GitHubAuthorizationError();
+    }
+    const access = await githubFetch<{
+      token: string;
+      repositories?: Array<{ id: number; full_name: string; owner?: { id?: number } }>;
+    }>(`/app/installations/${installationId}/access_tokens`, {
+      token: appJwt(this.#env),
+      method: "POST",
+      body: { repository_ids: [id] },
+    }).catch((error: unknown) => {
+      // These statuses at the grant endpoint mean this installation cannot
+      // grant the requested repository. A 401 is an App credential problem;
+      // failures from later PR/check calls retain their provider context.
+      if (error instanceof GitHubRequestError && !error.retryable && [403, 404, 422].includes(error.status ?? 0)) {
+        throw new GitHubAuthorizationError();
+      }
+      throw error;
     });
-    const access = await githubFetch<{ token: string; expires_at: string }>(
-      `/app/installations/${installation.id}/access_tokens`,
-      { token: jwt, method: "POST", body: {} },
-    );
-    this.#installationTokens.set(cacheKey, {
-      token: access.token,
-      expiresAt: new Date(access.expires_at).getTime(),
-    });
-    return access.token;
+    if (!access || typeof access !== "object") throw new GitHubRequestError(null);
+    const repository = access.repositories?.[0];
+    if (
+      access.repositories?.length !== 1 || !repository ||
+      typeof access.token !== "string" || !access.token ||
+      repository.id !== id || !Number.isSafeInteger(repository.id) ||
+      typeof repository.full_name !== "string" ||
+      !/^[^/\s?#]+\/[^/\s?#]+$/.test(repository.full_name)
+    ) throw new GitHubAuthorizationError();
+    let repositoryOwnerId: string;
+    try {
+      repositoryOwnerId = decimalId(repository.owner?.id, "repository owner ID");
+    } catch {
+      throw new GitHubAuthorizationError();
+    }
+    const [owner, repo] = repository.full_name.split("/");
+    return { token: access.token, repositoryId, repositoryOwnerId, owner, repo, fullName: repository.full_name };
   }
 
-  async createCheckRun(input: RunStartRequest & { cycleKey: string }): Promise<number> {
-    const token = await this.tokenForRepo(input.owner, input.repo);
+  async getPullRequest(access: RepositoryAccess, prNumber: number): Promise<GitHubPullRequest> {
+    const pr = await githubFetch<{
+      number: number; state: string; draft: boolean; title: string;
+      head: { sha: string }; user: { login: string };
+    }>(`${repositoryPath(access)}/pulls/${prNumber}`, { token: access.token });
+    if (
+      pr.number !== prNumber || !["open", "closed"].includes(pr.state) ||
+      typeof pr.draft !== "boolean" || typeof pr.title !== "string" ||
+      typeof pr.head?.sha !== "string" || typeof pr.user?.login !== "string"
+    ) throw new GitHubRequestError(null);
+    return { state: pr.state as "open" | "closed", draft: pr.draft, headSha: pr.head.sha, prTitle: pr.title, prAuthor: pr.user.login };
+  }
+
+  async createCheckRun(input: { headSha: string; cycleKey: string }, access: RepositoryAccess): Promise<number> {
     const check = await githubFetch<{ id: number }>(
-      `/repos/${input.owner}/${input.repo}/check-runs`,
+      `${repositoryPath(access)}/check-runs`,
       {
-        token,
+        token: access.token,
         method: "POST",
         body: {
           name: GITHUB_CHECK_NAME,
@@ -244,17 +319,17 @@ export class GitHubClient {
   }
 
   async updateCheckRun(
-    cycle: Pick<CycleRecord, "owner" | "repo" | "checkRunId">,
+    cycle: Pick<CycleRecord, "checkRunId">,
     input: {
       status?: "in_progress" | "completed";
       conclusion?: CheckConclusion;
       output: CheckOutput;
     },
+    access: RepositoryAccess,
   ): Promise<void> {
     if (!cycle.checkRunId) return;
-    const token = await this.tokenForRepo(cycle.owner, cycle.repo);
-    await githubFetch(`/repos/${cycle.owner}/${cycle.repo}/check-runs/${cycle.checkRunId}`, {
-      token,
+    await githubFetch(`${repositoryPath(access)}/check-runs/${cycle.checkRunId}`, {
+      token: access.token,
       method: "PATCH",
       body: {
         status: input.status ?? (input.conclusion ? "completed" : "in_progress"),
@@ -265,12 +340,11 @@ export class GitHubClient {
     });
   }
 
-  async comment(cycle: CycleRecord, body: string): Promise<string> {
-    const token = await this.tokenForRepo(cycle.owner, cycle.repo);
+  async comment(cycle: CycleRecord, body: string, access: RepositoryAccess): Promise<string> {
     const comment = await githubFetch<IssueComment>(
-      `/repos/${cycle.owner}/${cycle.repo}/issues/${cycle.prNumber}/comments`,
+      `${repositoryPath(access)}/issues/${cycle.prNumber}/comments`,
       {
-        token,
+        token: access.token,
         method: "POST",
         body: { body },
       },
@@ -281,12 +355,13 @@ export class GitHubClient {
   // Retry policy: the comment POST is single-shot (retrying after a post-write
   // timeout would duplicate PR comments — not idempotent); the check-run PATCH
   // is idempotent and retried. Callers must NOT wrap these methods in withRetry.
-  async accept(cycle: CycleRecord): Promise<void> {
+  async accept(cycle: CycleRecord, access: RepositoryAccess): Promise<void> {
     const commentUrl = await this.comment(
       cycle,
       renderTemplate(GITHUB_ACCEPT_COMMENT, {
         pr_author: cycle.prAuthor,
       }).trim(),
+      access,
     );
     await withRetry(() =>
       this.updateCheckRun(cycle, {
@@ -295,17 +370,18 @@ export class GitHubClient {
           title: "Feature-Rec: accepted",
           summary: `Validation passed. See PR conversation: ${commentUrl}`,
         },
-      }),
+      }, access),
     );
   }
 
-  async reject(cycle: CycleRecord, reviewComment: string): Promise<void> {
+  async reject(cycle: CycleRecord, reviewComment: string, access: RepositoryAccess): Promise<void> {
     const commentUrl = await this.comment(
       cycle,
       renderTemplate(GITHUB_REJECT_COMMENT, {
         review_comment: reviewComment,
         pr_author: cycle.prAuthor,
       }).trim(),
+      access,
     );
     await withRetry(() =>
       this.updateCheckRun(cycle, {
@@ -314,7 +390,7 @@ export class GitHubClient {
           title: "Feature-Rec: rejected",
           summary: `Validation requested changes. See PR conversation: ${commentUrl}`,
         },
-      }),
+      }, access),
     );
   }
 }

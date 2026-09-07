@@ -20,27 +20,29 @@ export const ReviewCycleStatusSchema = z.enum([
 export type ReviewCycleStatus = z.infer<typeof ReviewCycleStatusSchema>;
 
 export const RunStartRequestSchema = z.object({
-  owner: z.string().min(1),
-  repo: z.string().min(1),
   prNumber: z.number().int().positive(),
-  prTitle: z.string().default(""),
-  prAuthor: z.string().default(""),
   headSha: z.string().min(7),
-  baseSha: z.string().min(7),
 });
 export type RunStartRequest = z.infer<typeof RunStartRequestSchema>;
 
-export const RunStartResponseSchema = z.object({
-  cycleId: z.string().min(1),
-  cycleKey: z.string().min(1),
-  checkRunId: z.number().int().positive().optional(),
-  duplicate: z.boolean().optional(),
-  attemptId: z.string().min(1).optional(),
-  // Advisory: whether the tenant has any Slack review channel. Lets the
-  // runner fail a frontend-visible PR before rendering; video-time channel
-  // resolution stays authoritative.
-  onboarded: z.boolean().optional(),
-});
+export const RunStartResponseSchema = z.union([
+  z.object({
+    skipped: z.literal(true),
+    reason: z.enum(["closed", "draft", "stale_head"]),
+  }),
+  z.object({
+    skipped: z.literal(false).optional(),
+    cycleId: z.string().min(1),
+    cycleKey: z.string().min(1),
+    checkRunId: z.number().int().positive().optional(),
+    duplicate: z.boolean().optional(),
+    attemptId: z.string().min(1).optional(),
+    // Advisory: whether the tenant has any Slack review channel. Lets the
+    // runner fail a frontend-visible PR before rendering; video-time channel
+    // resolution stays authoritative.
+    onboarded: z.boolean().optional(),
+  }),
+]);
 export type RunStartResponse = z.infer<typeof RunStartResponseSchema>;
 
 export const SlackApprovalPayloadSchema = z.object({
@@ -53,8 +55,10 @@ export type SlackApprovalPayload = z.infer<typeof SlackApprovalPayloadSchema>;
 export const ReviewCycleSchema = z.object({
   id: z.string(),
   cycleKey: z.string(),
-  owner: z.string(),
-  repo: z.string(),
+  tenantId: z.string().uuid(),
+  repositoryId: z.string().regex(/^[0-9]+$/),
+  owner: z.string().nullable(),
+  repo: z.string().nullable(),
   prNumber: z.number().int().positive(),
   headSha: z.string(),
   status: ReviewCycleStatusSchema,
@@ -67,6 +71,19 @@ export const ReviewCycleSchema = z.object({
 export type ReviewCycle = z.infer<typeof ReviewCycleSchema>;
 
 export function buildCycleKey(input: {
+  tenantId: string;
+  repositoryId: string;
+  prNumber: number;
+  headSha: string;
+}): string {
+  return `${input.tenantId}/${input.repositoryId}#${input.prNumber}:${input.headSha}`;
+}
+
+// Backfill and runtime share the same canonical identity implementation.
+export const buildTenantCycleKey = buildCycleKey;
+
+// Only the qualified deploy-A rollback command may rebuild legacy identities.
+export function buildLegacyCycleKey(input: {
   owner: string;
   repo: string;
   prNumber: number;
@@ -75,16 +92,25 @@ export function buildCycleKey(input: {
   return `${input.owner}/${input.repo}#${input.prNumber}:${input.headSha}`;
 }
 
-// Keep the singleton identity during the compatibility window while exposing
-// the multitenant identity to backfill and validation tooling. The action and
-// service must switch to this builder together.
-export function buildTenantCycleKey(input: {
-  tenantId: string;
-  repositoryId: string;
-  prNumber: number;
-  headSha: string;
-}): string {
-  return `${input.tenantId}/${input.repositoryId}#${input.prNumber}:${input.headSha}`;
+export function normalizeOidcAudience(
+  value: string,
+  options: { allowLoopbackHttp?: boolean } = {},
+): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Feature-Rec base URL must be an explicit valid HTTPS URL.");
+  }
+  const loopback = url.hostname === "localhost" || url.hostname === "[::1]" ||
+    /^127(?:\.[0-9]{1,3}){3}$/.test(url.hostname);
+  if (
+    (url.protocol !== "https:" && !(options.allowLoopbackHttp && loopback && url.protocol === "http:")) ||
+    url.username || url.password || url.search || url.hash || value.includes("?") || value.includes("#")
+  ) {
+    throw new Error("Feature-Rec base URL must use HTTPS without credentials, query, or fragment; loopback HTTP is allowed only in local development or tests.");
+  }
+  return url.toString().replace(/\/+$/, "");
 }
 
 export function isAllowedPullRequestEvent(event: {

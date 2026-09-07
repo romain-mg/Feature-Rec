@@ -33,4 +33,3 @@ jobs:
       - uses: Hanibzd/Feature-Rec/packages/action@main
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          FEATURE_REC_RUNNER_TOKEN: ${{ secrets.FEATURE_REC_RUNNER_TOKEN }}

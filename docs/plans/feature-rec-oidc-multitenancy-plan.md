@@ -1,10 +1,17 @@
 # Feature-Rec OIDC and Multitenancy Dev Plan
 
-Status: expand/prepare implemented; runtime cutover and contract migrations pending
+Status: PR A expand/prepare and PR B runtime implementation complete; production cutover and PR C/D migrations pending
 
 Date: 2026-09-03
 
 Last reviewed: 2026-09-04
+
+PR B implemented: 2026-09-05. The action and service use OIDC and tenant/repository
+identity, with workspace-bound Slack clients and compatibility writes retained.
+No migration after `0008_multitenant_expand` is registered. Local verification
+passed typecheck, lint, the full selftest suite, the production image build, and
+compiled-admin/health smoke tests against isolated PostgreSQL. Production
+backfill/cutover and the real two-tenant smoke remain operator release steps.
 
 Scope: `packages/core`, `packages/action`, `packages/service`, migrations,
 operator tooling, CI, and product documentation
@@ -65,8 +72,8 @@ account/installation. Database uniqueness enforces both limits.
 - Advisory locks and supersession use
 `tenant_id + repository_id + pr_number`.
 - Repository names are transient GitHub API coordinates, not durable identity.
-- GitHub repository access is proven by minting an installation access token
-scoped to the verified repository ID.
+- GitHub repository access is proven by minting an installation token scoped to
+the verified repository ID for each logical operation, without a token cache.
 - GitHub-to-Slack routing follows the tenant's unique workspace. Do not store
 `slack_workspace_id` on GitHub installations or review cycles.
 - `selected_channel_id` belongs to `slack_workspaces`.
@@ -284,7 +291,7 @@ After OIDC verification:
 1. Look up `github_installations.github_account_id` using the verified
  `repository_owner_id`.
 2. Join its tenant and require `tenants.enabled = true`.
-3. Mint an installation token with:
+3. Mint fresh installation access scoped to the verified repository ID:
 
  ```http
  POST /app/installations/{installation_id}/access_tokens
@@ -292,7 +299,7 @@ After OIDC verification:
  { "repository_ids": [<verified repository_id>] }
  ```
 
-4. Require GitHub's returned repository metadata to contain exactly the
+4. Require the token response's repository metadata to contain exactly the
  requested repository ID, and cross-check its owner ID against the verified
  owner ID.
 5. Use the returned current `full_name` only as the coordinates for GitHub REST
@@ -370,7 +377,7 @@ must never use those values.
 - The action requests a fresh OIDC JWT immediately before each backend call so
 a long render does not reuse an expired start token.
 - The backend verifies and binds the JWT to the cycle before mutating state.
-- GitHub operations mint repository-scoped installation access from the cycle's
+- GitHub operations obtain repository-scoped installation access from the cycle's
 tenant and repository.
 - `/video` obtains the tenant's Slack workspace, decrypts that workspace's token,
 and resolves only its channels/settings.
@@ -420,10 +427,15 @@ state transition.
 
 Handle lifecycle events idempotently:
 
-- `app_uninstalled`: delete `slack_workspaces` by signed envelope `team_id`.
-- `tokens_revoked`: because beta stores no Slack user tokens, treat any verified
-  token-revocation event for the team as revocation of the only credential and
-  delete the workspace row. Revisit this rule before storing user tokens.
+- For `app_uninstalled` and `tokens_revoked`, resolve the current credential by
+  signed envelope `team_id` and check it using `auth.test`. Only a definitive
+  revoked/inactive token permits deletion. A valid current token makes the
+  lifecycle event stale; provider/crypto uncertainty returns `503` for retry.
+  Treat `invalid_auth` as uncertain because Slack also uses it for IP allowlist
+  rejection.
+- Conditional deletion must compare the checked ciphertext under the provisioning
+  lock. Provisioning writes fresh randomized ciphertext, fencing a reinstall
+  during the credential check even if its bot user ID stays the same.
 - In the same transaction, delete that team's `channel_settings` explicitly,
   delete the workspace row, and set the owning tenant's `enabled` flag to
   `false`. Keep the explicit settings delete after the FK is added: it is
@@ -434,7 +446,7 @@ Handle lifecycle events idempotently:
 tenant is disabled; lifecycle cleanup must not depend on product entitlement.
 - The tenant and historical review cycles remain. From deploy C onward, the FK
   cascade is a database backstop in addition to the explicit delete.
-- Late/reordered lifecycle deliveries are safe because deletion is idempotent.
+- Late/reordered deliveries are safe because cleanup verifies the current token and conditionally deletes that exact credential.
 
 User-visible Slack text must not require persisted repository names. At initial
 video/validation posting, pass the current `full_name` obtained from GitHub.
@@ -467,9 +479,13 @@ authorizeRepository(installationId: string, repositoryId: string)
 
 Then make check-run/comment methods accept `RepositoryAccess` rather than
 looking up a token from stored names. Remove the name-keyed installation-token
-cache. For beta volume, minting a scoped token per logical operation keeps rename,
-transfer, revocation, and repository-selection behavior current and avoids stale
-`full_name` cache semantics.
+cache and mint fresh repository-scoped access for each logical operation. The
+token response supplies current repository metadata for validation and REST
+coordinates. After potentially long Slack delivery, reacquire cycle-bound
+repository access before the failure-path check update: even a newly minted
+token can expire during delivery. Keep Slack cleanup independent if that fresh
+authorization fails. Never automatically replay a comment POST when recovering
+credentials.
 
 Keep the token opaque: GitHub installation-token formats may change, and code
 must not inspect length or prefix.
@@ -904,7 +920,7 @@ make A a general binary rollback target. Delete the hosted values after deploy D
 - Validate returned repository and owner IDs.
 - Add PR fetch/validation.
 - Pass ephemeral repository access to check/comment methods.
-- Remove mutable-name discovery and token caching.
+- Remove runtime mutable-name discovery and installation-token caching.
 - Remove the direct `FEATURE_REC_GITHUB_TOKEN`/`GITHUB_TOKEN` fallback outright.
 - Keep comment POST retry behavior unchanged: do not retry a possibly successful
 non-idempotent comment write.
@@ -960,7 +976,7 @@ failures consistently without leaking tenant existence.
 
 ### Documentation and deployment files
 
-- Remove runner-secret setup from `README.md`, `docs/feature-rec.md`,
+- Remove runner-secret setup from `README.md`, `docs/setup-and-operations.md`,
 `.env.example`, the example workflow, and hosted deployment docs.
 - Document `id-token: write`, issuer/audience, token encryption, operator
 provisioning, and multi-workspace Slack installation.
@@ -1036,6 +1052,12 @@ attachment races preserve their existing semantics.
 ### GitHub behavior tests
 
 - Scoped-token request contains only the requested repository ID.
+- Every authorization mints a fresh token, including repeated calls for the same
+  installation/repository pair; a previous grant cannot hide a later rejection.
+- Grant denials, provider outages, rate limits, and malformed responses retain
+  their safe error mapping, including after an earlier successful grant.
+- Video failure cleanup obtains fresh access after a long Slack upload; failed
+  reauthorization leaves the stored failure and independent Slack cleanup intact.
 - Current full name is used for REST coordinates.
 - Repository rename between operations uses the new name.
 - Transfer to an unauthorized owner fails; later authorization under a different
@@ -1322,3 +1344,62 @@ repositories; it must report and stop rather than guess or silently delete.
 - Describing onboarding UI/OAuth as deferred beyond beta contradicts the launch
   scope. The invite-only page is a separate pre-beta requirement, while this
   implementation deliberately stops at temporary operator provisioning.
+
+## Plan caveats from PR B review validation (2026-09-05)
+
+- The statement that late/reordered lifecycle deliveries are safe solely because
+  deletion is idempotent is incomplete. Re-provisioning the same team between an
+  old uninstall/revocation and its delivery lets the old event delete the new
+  workspace. Event-ID deduplication alone cannot reject a never-successfully-
+  processed old event or the distinct companion lifecycle event. The lifecycle
+  design needs a reliable way to distinguish events predating the current
+  installation; any dedupe bookkeeping and deletion must commit atomically.
+  Resolved in the review follow-up: live current-token verification plus atomic
+  compare-and-delete under the provisioning lock. No event-ID-only dedupe or new
+  migration is needed; provider uncertainty leaves the row intact for retry.
+- The workflow cutover instructions assume existing active consumers. The user
+  clarified that no Feature-Rec runner workflow is currently active, so pinning
+  an existing pre-cutover workflow is presently inapplicable. Removing the dead
+  runner-secret reference from the example is still required. Resolved in the
+  user-approved follow-up: keep the development example on `@main` for now and
+  remove the retired secret. Immutable consumer rollout remains a separate step.
+
+## PR B lifecycle review follow-up (2026-09-07)
+
+- Resolved: `invalid_auth` is not conclusive revocation; it can indicate an IP
+  allowlist rejection. Only `token_revoked` and `account_inactive` permit
+  lifecycle deletion. Ambiguous errors preserve the workspace for retry.
+- Open operational limitation: synchronous lifecycle verification and deletion
+  can exceed Slack's three-second acknowledgement window under provider latency
+  or provisioning-lock contention. Retries are safe, but immediate successful
+  acknowledgement needs a durable event queue and retrying worker. Event-ID
+  deduplication with in-memory background work alone would lose cleanup on a
+  crash and suppress Slack's retries after a verification or database failure.
+
+## PR B token-cache and delivery follow-up (2026-09-07)
+
+- Superseded by the later simplification decision below: the user initially
+  requested keeping scoped tokens cached by installation ID and repository ID
+  until one minute before expiry, with live metadata checks on reuse.
+- Resolved: a supersession racing failed Slack message attachment could leave
+  the locally captured post with live buttons. The stale error branch now
+  finalizes that post when the stored cycle is superseded and preserves other
+  decisions; regressions cover cleanup retries and failure.
+- Resolved: settled video responses now have explicit regression assertions for
+  the `502` branch and the `503` `Retry-After` value.
+- Resolved: the operations guide's Slack acknowledgement citation uses the
+  verified `#responding` anchor.
+
+## PR B token and long-delivery simplification (2026-09-07)
+
+- User decision: remove the installation-token cache. Its live metadata lookup
+  replaced a mint with another GitHub request and introduced expiry and eviction
+  handling. Each logical operation now mints fresh repository-scoped access.
+- Resolved: video failure cleanup previously reused access obtained before an
+  unbounded Slack upload. It now reacquires access for the cycle before updating
+  the check; regression coverage simulates expiry during delivery and failed
+  reauthorization without blocking independent Slack cleanup.
+- Coverage follows the remaining paths: repeated grants, rejection after prior
+  success, safe provider failures, and recovery. Cache-listing `total_count` and
+  post-eviction cases no longer exist. Same-request content-mismatch reminting
+  and concurrent duplicate-mint optimization are explicitly out of scope.

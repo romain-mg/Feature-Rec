@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Kysely, PostgresDialect, sql } from "kysely";
 import { Migrator } from "kysely/migration";
 import { Client, Pool } from "pg";
@@ -9,12 +10,13 @@ import {
   SLACK_MULTIPLE_CHANNELS_MESSAGE,
   SLACK_NO_CHANNEL_MESSAGE,
   slackSelectedChannelUnavailableMessage,
-  type RunStartRequest,
 } from "@feature-rec/core";
 import { ChannelResolutionError, resolveChannel } from "../src/channels";
-import { GitHubClient, GitHubRequestError } from "../src/github";
+import { GitHubClient, GitHubRequestError, type RepositoryAccess } from "../src/github";
 import { readEnv, type ServiceEnv } from "../src/env";
 import { buildServer } from "../src/http";
+import { OidcAuthenticationError } from "../src/oidc";
+import type { StartCycleInput } from "../src/storage";
 import { SlackClient, verifySlackSignature } from "../src/slack";
 import {
   decryptSlackToken,
@@ -51,17 +53,45 @@ const env: ServiceEnv = {
   port: 0,
   baseUrl: "http://localhost",
   databaseUrl: testUrl,
-  runnerToken: "runner-secret",
-  githubToken: "",
   githubAppId: "",
   githubPrivateKey: "",
-  slackBotToken: "",
   slackSigningSecret: "slack-secret",
-  slackTokenEncryptionKey: null,
+  slackTokenEncryptionKey: Buffer.alloc(32, 7),
   githubOidcIssuer: "https://token.actions.githubusercontent.com",
 };
 
-const RUNNER_AUTH = `Bearer ${env.runnerToken}`;
+function fixtureIdentity(teamId: string) {
+  const digest = crypto.createHash("sha256").update(teamId).digest("hex");
+  const number = parseInt(digest.slice(0, 8), 16);
+  return {
+    tenantId: `${digest.slice(0, 8)}-${digest.slice(8, 12)}-4${digest.slice(13, 16)}-a${digest.slice(17, 20)}-${digest.slice(20, 32)}`,
+    repositoryOwnerId: String(number),
+    installationId: String(number + 1000),
+  };
+}
+function repositoryIdFor(owner: string, repo: string): string {
+  return String(parseInt(crypto.createHash("sha256").update(`${owner}/${repo}`).digest("hex").slice(0, 8), 16));
+}
+const DEFAULT_REPOSITORY_ID = repositoryIdFor("MathFreedom", "Agora");
+const repositories = new Map<string, { owner: string; repo: string }>([
+  [DEFAULT_REPOSITORY_ID, { owner: "MathFreedom", repo: "Agora" }],
+]);
+const requestedPullRequest = new AsyncLocalStorage<Omit<StartCycleInput, "cycleKey">>();
+const appFixtures = new Map<AppInstance, { teamId: string }>();
+
+async function seedWorkspace(teamId: string): Promise<void> {
+  const identity = fixtureIdentity(teamId);
+  const connection = new Client({ connectionString: testUrl });
+  await connection.connect();
+  try {
+    await connection.query("insert into tenants (id, enabled) values ($1, true) on conflict (id) do nothing", [identity.tenantId]);
+    await connection.query("insert into github_installations (installation_id, tenant_id, github_account_id) values ($1, $2, $3) on conflict (installation_id) do nothing", [identity.installationId, identity.tenantId, identity.repositoryOwnerId]);
+    await connection.query("insert into slack_token_encryption_key (id, verifier) values (1, $1) on conflict (id) do nothing", [crypto.createHmac("sha256", env.slackTokenEncryptionKey!).update("feature-rec:slack-token-key-check:v1").digest("base64")]);
+    await connection.query("insert into slack_workspaces (team_id, tenant_id, bot_user_id, bot_token_ciphertext) values ($1, $2, 'UBOT', $3) on conflict (team_id) do nothing", [teamId, identity.tenantId, encryptSlackToken({ token: `fixture-token-${teamId}`, teamId, key: env.slackTokenEncryptionKey! })]);
+  } finally {
+    await connection.end();
+  }
+}
 
 type StartResponse = {
   cycleId?: string;
@@ -80,12 +110,27 @@ type ResultResponse = {
   settled?: boolean;
 };
 
-type AppInstance = ReturnType<typeof buildServer>;
+type AppInstance = Awaited<ReturnType<typeof buildServer>>;
 
 const apps: AppInstance[] = [];
 
-function makeApp(github: unknown, slack: unknown): AppInstance {
-  const app = buildServer({ env, store, github: github as never, slack: slack as never });
+async function makeApp(github: ReturnType<typeof makeGithubStub>, slack: ReturnType<typeof makeSlackStub>): Promise<AppInstance> {
+  await seedWorkspace(slack.teamId);
+  github.identity = fixtureIdentity(slack.teamId);
+  const app = buildServer({
+    env, store, github: github as never,
+    oidc: { verify: async (authorization) => {
+      const match = /^Bearer fixture:([^:]+):([0-9]+)$/.exec(authorization ?? "");
+      if (!match || match[1] !== slack.teamId) throw new OidcAuthenticationError();
+      return { repositoryId: match[2], repositoryOwnerId: github.identity.repositoryOwnerId, eventName: "pull_request" };
+    } },
+    slackClientFactory: (token) => {
+      assert.equal(token, `fixture-token-${slack.teamId}`, "A request must use its tenant's workspace token");
+      return slack as never;
+    },
+    respondEphemeral: (url, text) => slack.respondEphemeral(url, text),
+  });
+  appFixtures.set(app, { teamId: slack.teamId });
   apps.push(app);
   return app;
 }
@@ -97,6 +142,16 @@ function makeGithubStub() {
   >();
   let nextId = 1000;
   const stub = {
+    identity: fixtureIdentity("T0123"),
+    authorizeRepository: async (_installationId: string, repositoryId: string): Promise<RepositoryAccess> => {
+      const coordinates = repositories.get(repositoryId)!;
+      return { token: "opaque-test-token", repositoryId, repositoryOwnerId: stub.identity.repositoryOwnerId, ...coordinates, fullName: `${coordinates.owner}/${coordinates.repo}` };
+    },
+    getPullRequest: async (_access: RepositoryAccess, prNumber: number) => {
+      const start = requestedPullRequest.getStore();
+      assert.ok(start, `No GitHub PR fixture for ${prNumber}`);
+      return { state: "open" as const, draft: false, headSha: start.headSha, prTitle: start.prTitle, prAuthor: start.prAuthor };
+    },
     createCheckRunCalls: 0,
     acceptCalls: 0,
     rejectCalls: 0,
@@ -133,6 +188,7 @@ function makeSlackStub(options: { teamId?: string; channels?: string[] } = {}) {
   const teamId = options.teamId ?? "T0123";
   const finalizeCalls: Array<{ state: string; channel: string; ts: string }> = [];
   const stub = {
+    teamId,
     channels: options.channels ?? ["C0123"],
     usergroups: [] as Array<{ id: string; handle: string }>,
     usergroupMembers: {} as Record<string, string[]>,
@@ -199,26 +255,31 @@ function makeSlackStub(options: { teamId?: string; channels?: string[] } = {}) {
   return stub;
 }
 
-function makeStart(prNumber: number, overrides: Partial<RunStartRequest> = {}): RunStartRequest {
-  return {
+function makeStart(prNumber: number, overrides: Partial<Omit<StartCycleInput, "cycleKey">> = {}): Omit<StartCycleInput, "cycleKey"> {
+  const start = {
+    tenantId: fixtureIdentity("T0123").tenantId,
+    repositoryId: DEFAULT_REPOSITORY_ID,
     owner: "MathFreedom",
     repo: "Agora",
     prNumber,
     prTitle: "Add button",
     prAuthor: "romain",
     headSha: "abc1234567",
-    baseSha: "def1234567",
     ...overrides,
   };
+  start.repositoryId = overrides.repositoryId ?? repositoryIdFor(start.owner, start.repo);
+  return start;
 }
 
-async function startRun(app: AppInstance, start: RunStartRequest) {
-  const res = await app.inject({
+async function startRun(app: AppInstance, start: Omit<StartCycleInput, "cycleKey">) {
+  const fixture = appFixtures.get(app)!;
+  repositories.set(start.repositoryId, { owner: start.owner, repo: start.repo });
+  const res = await requestedPullRequest.run(start, async () => await app.inject({
     method: "POST",
     url: "/api/runs/start",
-    headers: { authorization: RUNNER_AUTH, "content-type": "application/json" },
-    payload: JSON.stringify(start),
-  });
+    headers: { authorization: `Bearer fixture:${fixture.teamId}:${start.repositoryId}`, "content-type": "application/json" },
+    payload: JSON.stringify({ prNumber: start.prNumber, headSha: start.headSha }),
+  }));
   return { res, body: JSON.parse(res.body) as StartResponse };
 }
 
@@ -231,7 +292,7 @@ async function postResult(
   const res = await app.inject({
     method: "POST",
     url: `/api/runs/${cycleId}/${action}`,
-    headers: { authorization: RUNNER_AUTH, "content-type": "application/json" },
+    headers: { authorization: `Bearer fixture:${appFixtures.get(app)!.teamId}:${(await store.getCycle(cycleId))?.repositoryId ?? DEFAULT_REPOSITORY_ID}`, "content-type": "application/json" },
     payload: JSON.stringify(payload),
   });
   return { res, body: JSON.parse(res.body) as ResultResponse };
@@ -239,7 +300,7 @@ async function postResult(
 
 async function postVideo(app: AppInstance, cycleId: string, attemptId?: string) {
   const headers: Record<string, string> = {
-    authorization: RUNNER_AUTH,
+    authorization: `Bearer fixture:${appFixtures.get(app)!.teamId}:${(await store.getCycle(cycleId))?.repositoryId ?? DEFAULT_REPOSITORY_ID}`,
     "content-type": "application/octet-stream",
   };
   if (attemptId) headers["x-feature-rec-attempt"] = attemptId;
@@ -277,7 +338,7 @@ async function postBlockAction(
   const payload = {
     type: "block_actions",
     trigger_id: input.triggerId,
-    ...(input.teamId ? { team: { id: input.teamId } } : {}),
+    team: { id: input.teamId ?? appFixtures.get(app)!.teamId },
     ...(input.responseUrl ? { response_url: input.responseUrl } : {}),
     user: { id: input.userId ?? "U999" },
     actions: [
@@ -316,7 +377,7 @@ async function postViewSubmission(
 ) {
   const payload = {
     type: "view_submission",
-    ...(input.teamId ? { team: { id: input.teamId } } : {}),
+    team: { id: input.teamId ?? appFixtures.get(app)!.teamId },
     user: { id: input.userId ?? "U999" },
     view: {
       id: input.viewId,
@@ -416,6 +477,7 @@ async function waitFor(predicate: () => Promise<boolean>, timeoutMs = 3000): Pro
 
 const store = new PostgresCycleStore(testUrl);
 await store.init();
+for (const teamId of ["T0123", "TAMBIG", "TRACEINIT", "TSTORE", "TSTORE-OTHER"]) await seedWorkspace(teamId);
 
 try {
   // --- Authentication configuration and Slack token envelope ---
@@ -444,12 +506,13 @@ try {
 
     const parsed = readEnv({
       DATABASE_URL: testUrl,
+      FEATURE_REC_BASE_URL: "https://feature-rec.test",
       FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY: encodedKey,
     });
     assert.deepEqual(parsed.slackTokenEncryptionKey, key);
     assert.equal(parsed.githubOidcIssuer, "https://token.actions.githubusercontent.com");
     assert.throws(
-      () => readEnv({ DATABASE_URL: testUrl, GITHUB_OIDC_ISSUER: "http://issuer.example" }),
+      () => readEnv({ DATABASE_URL: testUrl, FEATURE_REC_BASE_URL: "https://feature-rec.test", GITHUB_OIDC_ISSUER: "http://issuer.example" }),
       /HTTPS URL/,
     );
   }
@@ -803,9 +866,10 @@ try {
     }) as typeof fetch;
 
     try {
-      const client = new GitHubClient({ ...env, githubToken: "gh-token" });
-      await client.reject(cycleForGithub, "make it feel premium");
-      await client.accept(cycleForGithub);
+      const client = new GitHubClient(env);
+      const access: RepositoryAccess = { token: "gh-token", repositoryId: start.repositoryId, repositoryOwnerId: fixtureIdentity("T0123").repositoryOwnerId, owner: start.owner, repo: start.repo, fullName: `${start.owner}/${start.repo}` };
+      await client.reject(cycleForGithub, "make it feel premium", access);
+      await client.accept(cycleForGithub, access);
     } finally {
       globalThis.fetch = previousFetch;
     }
@@ -927,7 +991,7 @@ try {
 
   // --- HTTP auth: start without a runner token is unauthorized ---
   {
-    const app = makeApp(makeGithubStub(), makeSlackStub());
+    const app = await makeApp(makeGithubStub(), makeSlackStub());
     const res = await app.inject({
       method: "POST",
       url: "/api/runs/start",
@@ -939,7 +1003,7 @@ try {
 
   // --- HTTP: invalid Slack signature is rejected ---
   {
-    const app = makeApp(makeGithubStub(), makeSlackStub());
+    const app = await makeApp(makeGithubStub(), makeSlackStub());
     const timestamp = String(Math.floor(Date.now() / 1000));
     const res = await app.inject({
       method: "POST",
@@ -973,7 +1037,7 @@ try {
   // --- (a) newer-head supersession over HTTP; loser's check run neutralized ---
   {
     const github = makeGithubStub();
-    const app = makeApp(github, makeSlackStub());
+    const app = await makeApp(github, makeSlackStub());
     const a = makeStart(3, { headSha: "httpsup001a" });
     const b = makeStart(3, { headSha: "httpsup002b" });
     const [ra, rb] = await Promise.all([startRun(app, a), startRun(app, b)]);
@@ -1000,7 +1064,7 @@ try {
   // --- Superseded cleanup is best-effort: a failed old check update must not block the new run ---
   {
     const github = makeGithubStub();
-    const app = makeApp(github, makeSlackStub());
+    const app = await makeApp(github, makeSlackStub());
     const first = (await startRun(app, makeStart(14, { headSha: "cleanup001a" }))).body;
     assert.ok(first.checkRunId);
 
@@ -1027,7 +1091,7 @@ try {
   // --- (b) same-head duplicate start: one created, one duplicate, one check run ---
   {
     const github = makeGithubStub();
-    const app = makeApp(github, makeSlackStub());
+    const app = await makeApp(github, makeSlackStub());
     const start = makeStart(4, { headSha: "httpdup001" });
     const [r1, r2] = await Promise.all([startRun(app, start), startRun(app, start)]);
     const bodies = [r1.body, r2.body];
@@ -1051,7 +1115,7 @@ try {
       }
       return createCheckRun();
     };
-    const app = makeApp(github, makeSlackStub());
+    const app = await makeApp(github, makeSlackStub());
     const start = makeStart(15, { headSha: "retryinit01" });
 
     const failed = await startRun(app, start);
@@ -1070,7 +1134,7 @@ try {
   {
     const github = makeGithubStub();
     const slack = makeSlackStub();
-    const app = makeApp(github, slack);
+    const app = await makeApp(github, slack);
     const a = makeStart(5, { headSha: "stale0001a" });
     const b = makeStart(5, { headSha: "stale0002b" });
     const startA = (await startRun(app, a)).body;
@@ -1095,7 +1159,7 @@ try {
 
   // --- (d) attempt ownership: wrong token is stale, missing/malformed is 400 ---
   {
-    const app = makeApp(makeGithubStub(), makeSlackStub());
+    const app = await makeApp(makeGithubStub(), makeSlackStub());
     const start = (await startRun(app, makeStart(6, { headSha: "attempt001" }))).body;
     assert.ok(start.cycleId);
 
@@ -1113,7 +1177,7 @@ try {
 
   // --- (e) runner /accepted on a pending_validation cycle is stale ---
   {
-    const app = makeApp(makeGithubStub(), makeSlackStub());
+    const app = await makeApp(makeGithubStub(), makeSlackStub());
     const start = (await startRun(app, makeStart(7, { headSha: "pending001" }))).body;
     assert.ok(start.cycleId);
     assert.ok(start.attemptId);
@@ -1131,7 +1195,7 @@ try {
   // --- (f) stale duplicate start can't displace the active head ---
   {
     const github = makeGithubStub();
-    const app = makeApp(github, makeSlackStub());
+    const app = await makeApp(github, makeSlackStub());
     const a = makeStart(8, { headSha: "displace01a" });
     const b = makeStart(8, { headSha: "displace02b" });
     const startA = (await startRun(app, a)).body;
@@ -1149,17 +1213,20 @@ try {
   // --- (g) double Slack click: only one GitHub accept, loser stops at transition ---
   {
     const github = makeGithubStub();
-    const app = makeApp(github, makeSlackStub());
+    const app = await makeApp(github, makeSlackStub());
     const start = (await startRun(app, makeStart(9, { headSha: "dblclick01" }))).body;
     assert.ok(start.cycleId);
     assert.ok(start.attemptId);
     await store.transitionRunnerStatus({
+      tenantId: fixtureIdentity("T0123").tenantId,
+      repositoryId: DEFAULT_REPOSITORY_ID,
       cycleId: start.cycleId,
       attemptId: start.attemptId,
       from: ["analyzing"],
       to: "pending_validation",
     });
 
+    await store.attachSlackMessage(start.cycleId, "C0123", "1710000000.000001");
     await Promise.all([
       postBlockAction(app, {
         cycleId: start.cycleId,
@@ -1193,17 +1260,20 @@ try {
       slack.isApproverCalls += 1;
       return false;
     };
-    const app = makeApp(github, slack);
+    const app = await makeApp(github, slack);
     const start = makeStart(10, { headSha: "approver01" });
     const created = await store.startCycle({ ...start, cycleKey: buildCycleKey(start) });
     assert.ok(created.attemptId);
     await store.transitionRunnerStatus({
+      tenantId: fixtureIdentity("T0123").tenantId,
+      repositoryId: DEFAULT_REPOSITORY_ID,
       cycleId: created.cycle.id,
       attemptId: created.attemptId,
       from: ["analyzing"],
       to: "pending_validation",
     });
 
+    await store.attachSlackMessage(created.cycle.id, "C0123", "1710000000.000003");
     await postBlockAction(app, {
       cycleId: created.cycle.id,
       headSha: "approver01",
@@ -1222,7 +1292,7 @@ try {
   {
     const github = makeGithubStub();
     const slack = makeSlackStub();
-    const app = makeApp(github, slack);
+    const app = await makeApp(github, slack);
     const startA = (await startRun(app, makeStart(11, { headSha: "video0001a" }))).body;
     assert.ok(startA.cycleId);
     assert.ok(startA.attemptId);
@@ -1249,7 +1319,7 @@ try {
   // --- (i) takeover from failed: fresh attempt, reused check run, old token stale ---
   {
     const github = makeGithubStub();
-    const app = makeApp(github, makeSlackStub());
+    const app = await makeApp(github, makeSlackStub());
     const start = makeStart(12, { headSha: "takeover01" });
     const first = (await startRun(app, start)).body;
     assert.ok(first.cycleId);
@@ -1299,6 +1369,7 @@ try {
         await resolveChannel(
           serializedStore as never,
           serializedSlack as never as SlackClient,
+          "TSERIAL",
         )
       ).channelId,
       "CSERIAL",
@@ -1319,14 +1390,14 @@ try {
     assert.match((await store.inspectSlackTokenEncryption(null)).keyError!, /ENCRYPTION_KEY is required/);
 
     await assert.rejects(
-      resolveChannel(store, slackClient),
+      resolveChannel(store, slackClient, "TROUTE"),
       (err: unknown) =>
         err instanceof ChannelResolutionError && err.message === SLACK_NO_CHANNEL_MESSAGE,
     );
 
     // One unambiguous live membership repairs a missed first-join event.
     slack.channels = ["CA"];
-    const repaired = await resolveChannel(store, slackClient);
+    const repaired = await resolveChannel(store, slackClient, "TROUTE");
     assert.equal(repaired.channelId, "CA");
     assert.equal(repaired.initializedRoute, true);
     assert.equal(await store.getSelectedChannelId("TROUTE"), "CA");
@@ -1341,14 +1412,14 @@ try {
 
     // Additional memberships never change the explicit route.
     slack.channels = ["CA", "CB"];
-    const existing = await resolveChannel(store, slackClient);
+    const existing = await resolveChannel(store, slackClient, "TROUTE");
     assert.equal(existing.channelId, "CA");
     assert.equal(existing.initializedRoute, false);
 
     // Removing the selected channel does not fail over to another membership.
     slack.channels = ["CB"];
     await assert.rejects(
-      resolveChannel(store, slackClient),
+      resolveChannel(store, slackClient, "TROUTE"),
       (err: unknown) =>
         err instanceof ChannelResolutionError &&
         err.message === slackSelectedChannelUnavailableMessage("CA"),
@@ -1356,7 +1427,7 @@ try {
 
     // Rejoining restores the retained route; an explicit switch changes it.
     slack.channels = ["CA", "CB"];
-    assert.equal((await resolveChannel(store, slackClient)).channelId, "CA");
+    assert.equal((await resolveChannel(store, slackClient, "TROUTE")).channelId, "CA");
     await store.selectTeamChannel({ teamId: "TROUTE", channelId: "CB" });
     assert.equal(
       (
@@ -1384,7 +1455,7 @@ try {
       }),
       true,
     );
-    assert.equal((await resolveChannel(store, slackClient)).channelId, "CB");
+    assert.equal((await resolveChannel(store, slackClient, "TROUTE")).channelId, "CB");
     // A later join must not replace the effective workspace selection with a stale legacy route.
     await routeClient.query("update team_channel_routes set selected_channel_id = 'CA' where team_id = 'TROUTE'");
     assert.equal((await store.initializeTeamChannelRoute({ teamId: "TROUTE", channelId: "CA" })).initializedRoute, false);
@@ -1412,8 +1483,8 @@ try {
       approvers: null,
     });
 
-    // During the compatibility window the populated workspace field wins reads,
-    // while the old route remains the fallback when the new value is null.
+    // The workspace remains authoritative even when its selection is null;
+    // rollback route dual writes never become runtime fallback reads.
     await routeClient.query(
       "update slack_workspaces set selected_channel_id = 'CA' where team_id = 'TROUTE'",
     );
@@ -1421,14 +1492,14 @@ try {
     await routeClient.query(
       "update slack_workspaces set selected_channel_id = null where team_id = 'TROUTE'",
     );
-    assert.equal(await store.getSelectedChannelId("TROUTE"), "CB");
+    assert.equal(await store.getSelectedChannelId("TROUTE"), null);
     await store.selectTeamChannel({ teamId: "TROUTE", channelId: "CB" });
     await routeClient.end();
 
     // Several memberships with no route are intentionally ambiguous.
     const ambiguous = makeSlackStub({ teamId: "TAMBIG", channels: ["CX", "CY"] });
     await assert.rejects(
-      resolveChannel(store, ambiguous as never as SlackClient),
+      resolveChannel(store, ambiguous as never as SlackClient, "TAMBIG"),
       (err: unknown) =>
         err instanceof ChannelResolutionError && err.message === SLACK_MULTIPLE_CHANNELS_MESSAGE,
     );
@@ -1445,7 +1516,7 @@ try {
   // --- Start onboarding is read-only; video owns missed-event initialization ---
   {
     const slack = makeSlackStub({ teamId: "TSTARTREAD", channels: ["CSTARTREAD"] });
-    const app = makeApp(makeGithubStub(), slack);
+    const app = await makeApp(makeGithubStub(), slack);
     const start = (await startRun(app, makeStart(19, { headSha: "startread01" }))).body;
     assert.equal(start.onboarded, true);
     assert.equal(await store.getSelectedChannelId("TSTARTREAD"), null);
@@ -1474,7 +1545,7 @@ try {
   // --- Shared tenant channel: repos share the active channel; mention default ---
   {
     const slack = makeSlackStub();
-    const app = makeApp(makeGithubStub(), slack);
+    const app = await makeApp(makeGithubStub(), slack);
     const first = (await startRun(app, makeStart(20, { headSha: "shared0001" }))).body;
     const second = (
       await startRun(app, makeStart(21, { repo: "OtherRepo", headSha: "shared0002" }))
@@ -1496,7 +1567,7 @@ try {
   // --- Validation mention comes from the channel settings at post time ---
   {
     const slack = makeSlackStub({ teamId: "TMENTION", channels: ["CM1"] });
-    const app = makeApp(makeGithubStub(), slack);
+    const app = await makeApp(makeGithubStub(), slack);
     await store.initializeTeamChannelRoute({ teamId: "TMENTION", channelId: "CM1" });
     assert.equal(
       await store.setSelectedChannelMentionSetting({
@@ -1660,7 +1731,7 @@ try {
   {
     const github = makeGithubStub();
     const slack = makeSlackStub({ teamId: "TVIDEO", channels: ["CVIDEO1", "CVIDEO2"] });
-    const app = makeApp(github, slack);
+    const app = await makeApp(github, slack);
     await store.initializeTeamChannelRoute({ teamId: "TVIDEO", channelId: "CVIDEO1" });
 
     const switched = (await startRun(app, makeStart(220, { headSha: "switchvid01" }))).body;
@@ -1691,7 +1762,7 @@ try {
   // --- Events: first join greets once; later joins and leaves are silent ---
   {
     const slack = makeSlackStub({ teamId: "TEVT", channels: [] });
-    const app = makeApp(makeGithubStub(), slack);
+    const app = await makeApp(makeGithubStub(), slack);
 
     const challenge = await postSlackEvent(app, { type: "url_verification", challenge: "chal123" });
     assert.equal(challenge.statusCode, 200);
@@ -1799,7 +1870,7 @@ try {
     slack.usergroups = [{ id: "S777", handle: "product-team" }];
     slack.usergroupMembers = { S777: ["U222"] };
     slack.channelMembers = { CCMD: ["UCMD", "U111", "U222"] };
-    const app = makeApp(makeGithubStub(), slack);
+    const app = await makeApp(makeGithubStub(), slack);
     let commandNumber = 0;
     const run = async (
       text: string,
@@ -1907,7 +1978,7 @@ try {
     assert.equal(slack.postMessageCalls.length, 0);
     assert.equal(
       (await run("status", "CCMD", "TOTHER")).body.text,
-      "This command belongs to a different Slack workspace.",
+      "Feature-Rec is not enabled for this Slack workspace.",
     );
     slack.channels = ["CCMD"];
 
@@ -2174,9 +2245,9 @@ try {
   // --- Restricted approval: non-approver gets an ephemeral reply, member accepts ---
   {
     const github = makeGithubStub();
-    const slack = makeSlackStub();
+    const slack = makeSlackStub({ teamId: "TAPPR" });
     slack.usergroupMembers = { S900: ["UMEMBER"] };
-    const app = makeApp(github, slack);
+    const app = await makeApp(github, slack);
     const start = (await startRun(app, makeStart(23, { headSha: "restrict01" }))).body;
     await postVideo(app, start.cycleId!, start.attemptId);
     await store.initializeTeamChannelRoute({ teamId: "TAPPR", channelId: "C0123" });
@@ -2230,9 +2301,9 @@ try {
   // --- Request-changes submissions: empty comment, unauthorized, rejection ---
   {
     const github = makeGithubStub();
-    const slack = makeSlackStub();
+    const slack = makeSlackStub({ teamId: "TAPPR" });
     slack.usergroupMembers = { S900: ["UMEMBER"] };
-    const app = makeApp(github, slack);
+    const app = await makeApp(github, slack);
     const start = (await startRun(app, makeStart(26, { headSha: "reject0001" }))).body;
     await postVideo(app, start.cycleId!, start.attemptId);
     // TAPPR/C0123 approvers were set to ["S900"] in the restricted-approval block.
@@ -2315,7 +2386,7 @@ try {
       });
     }) as typeof fetch;
     try {
-      const client = new SlackClient({ ...env, slackBotToken: "xoxb-test" });
+      const client = new SlackClient("xoxb-test");
       assert.deepEqual(await client.listBotChannels(), ["CP1", "CP2", "CP3", "CP4"]);
     } finally {
       globalThis.fetch = previousFetch;
@@ -2351,7 +2422,7 @@ try {
       });
     }) as typeof fetch;
     try {
-      const client = new SlackClient({ ...env, slackBotToken: "xoxb-test" });
+      const client = new SlackClient("xoxb-test");
       assert.deepEqual(await client.listChannelMembers("CMEMBERS"), ["U1", "U2", "U3"]);
     } finally {
       globalThis.fetch = previousFetch;
@@ -2375,7 +2446,7 @@ try {
         { status: 200, headers: { "content-type": "application/json" } },
       )) as typeof fetch;
     try {
-      const client = new SlackClient({ ...env, slackBotToken: "xoxb-test" });
+      const client = new SlackClient("xoxb-test");
       await assert.rejects(
         client.listChannelMembers("CBAD"),
         /Slack conversations\.members failed: invalid_arguments \(\[ERROR\] invalid channel argument\)/,
@@ -2397,7 +2468,7 @@ try {
       );
     }) as typeof fetch;
     try {
-      const client = new SlackClient({ ...env, slackBotToken: "xoxb-test" });
+      const client = new SlackClient("xoxb-test");
       assert.deepEqual(await client.listUsergroups(), [
         { id: "SENABLED", handle: "enabled" },
       ]);
@@ -2421,7 +2492,7 @@ try {
       });
     }) as typeof fetch;
     try {
-      const client = new SlackClient({ ...env, slackBotToken: "xoxb-test" });
+      const client = new SlackClient("xoxb-test");
       assert.equal(await client.isApprover(null, "Uany"), true);
       assert.equal(await client.isApprover(["U9"], undefined), false);
       assert.equal(await client.isApprover(["U9"], "U9"), true);
@@ -2437,7 +2508,7 @@ try {
   {
     const github = makeGithubStub();
     const slack = makeSlackStub({ teamId: "TEMPTY", channels: [] });
-    const app = makeApp(github, slack);
+    const app = await makeApp(github, slack);
     const start = (await startRun(app, makeStart(24, { headSha: "nochannel1" }))).body;
     // Advisory flag: an unboarded tenant is announced at start so the runner
     // can fail frontend-visible PRs before rendering.
@@ -2462,7 +2533,7 @@ try {
   {
     const github = makeGithubStub();
     const slack = makeSlackStub({ teamId: "TRACE", channels: [] });
-    const app = makeApp(github, slack);
+    const app = await makeApp(github, slack);
     const startA = (await startRun(app, makeStart(25, { headSha: "race0001aa" }))).body;
 
     // The membership poll starts a newer head before reporting no channels,
@@ -2620,7 +2691,7 @@ try {
     slack.listBotChannels = async () => {
       throw new Error("slack is down");
     };
-    const app = makeApp(makeGithubStub(), slack);
+    const app = await makeApp(makeGithubStub(), slack);
     const start = await startRun(app, makeStart(26, { headSha: "probe00001" }));
     assert.equal(start.res.statusCode, 200);
     assert.ok(start.body.attemptId);
