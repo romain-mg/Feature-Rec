@@ -611,11 +611,14 @@ export function buildServer(input: {
           }
           return reply.send({ ok: false, stale: true });
         }
-        // Slack delivery may outlive the token issued when the request arrived.
-        // Reauthorize this stored cycle before repairing GitHub; Slack cleanup
-        // must still run if that fresh grant cannot be obtained.
+        // Reuse only this request's grant, leaving time for the bounded GitHub
+        // retries. Long Slack delivery may require a fresh grant; its failure
+        // must not prevent independent Slack cleanup.
+        const failureAccess = access.expiresAt > Date.now() + 60_000
+          ? Promise.resolve(access)
+          : authorizeCycle(failed);
         const effects: Array<[string, Promise<unknown>]> = [
-          ["github delivery failure", authorizeCycle(failed).then((failureAccess) =>
+          ["github delivery failure", failureAccess.then((repositoryAccess) =>
             withRetry(() =>
               github.updateCheckRun(failed, {
                 conclusion: "failure",
@@ -625,7 +628,7 @@ export function buildServer(input: {
                     : channelError ? "Feature-Rec: no Slack review channel" : "Feature-Rec: video delivery failed",
                   summary: message,
                 },
-              }, failureAccess),
+              }, repositoryAccess),
             ),
           )],
         ];

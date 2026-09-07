@@ -35,6 +35,7 @@ export type GitHubRepositoryIdentity = GitHubInstallation & {
 
 export type RepositoryAccess = {
   token: string;
+  expiresAt: number;
   repositoryId: string;
   repositoryOwnerId: string;
   owner: string;
@@ -251,6 +252,7 @@ export class GitHubClient {
     }
     const access = await githubFetch<{
       token: string;
+      expires_at: unknown;
       repositories?: Array<{ id: number; full_name: string; owner?: { id?: number } }>;
     }>(`/app/installations/${installationId}/access_tokens`, {
       token: appJwt(this.#env),
@@ -266,6 +268,8 @@ export class GitHubClient {
       throw error;
     });
     if (!access || typeof access !== "object") throw new GitHubRequestError(null);
+    const expiresAt = typeof access.expires_at === "string" ? Date.parse(access.expires_at) : NaN;
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) throw new GitHubRequestError(null);
     const repository = access.repositories?.[0];
     if (
       access.repositories?.length !== 1 || !repository ||
@@ -281,7 +285,7 @@ export class GitHubClient {
       throw new GitHubAuthorizationError();
     }
     const [owner, repo] = repository.full_name.split("/");
-    return { token: access.token, repositoryId, repositoryOwnerId, owner, repo, fullName: repository.full_name };
+    return { token: access.token, expiresAt, repositoryId, repositoryOwnerId, owner, repo, fullName: repository.full_name };
   }
 
   async getPullRequest(access: RepositoryAccess, prNumber: number): Promise<GitHubPullRequest> {

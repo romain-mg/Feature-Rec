@@ -101,9 +101,11 @@ Feature-Rec is driven by the GitHub Action. The backend does not consume GitHub 
 All service GitHub calls use the tenant's GitHub App installation and a repository-scoped token.
 Each logical operation mints fresh access scoped to the repository ID and validates the returned
 repository ID, owner, and current name. Tokens and repository metadata are not cached across
-operations; renames need no data edit or process restart. If Slack delivery fails after a long
-upload, the service reacquires access before updating the failure check, because the token obtained
-before delivery may have expired. Provider outages and rate limits remain temporary failures.
+operations; renames need no data edit or process restart. Within a video request, the service retains
+the token's reported expiry. Failure cleanup reuses that access when more than 60 seconds remain,
+allowing time for the bounded check-update retries, and reacquires access otherwise. Reuse avoids an
+extra token request but does not refresh installation status or repository metadata during delivery.
+Provider outages and rate limits remain temporary failures.
 
 ## Slack App Setup
 

@@ -19,6 +19,7 @@ let repositoryId = 101;
 let ownerId = 601;
 let repositories = 1;
 let token: unknown = "a completely opaque token with no assumed prefix or length";
+let expiresAt: unknown = new Date(now + 3_600_000).toISOString();
 let failTokenStatus = 0;
 let nullTokenResponse = false;
 let commentFails = false;
@@ -36,7 +37,7 @@ globalThis.fetch = async (url, init) => {
   if (path.endsWith("/access_tokens")) {
     if (nullTokenResponse) return Response.json(null);
     if (failTokenStatus) return new Response("provider credential details must stay private", { status: failTokenStatus, headers: tokenFailureHeaders });
-    body = { token, repositories: Array.from({ length: repositories }, () => ({ id: repositoryId, full_name: fullName, owner: { id: ownerId } })) };
+    body = { token, expires_at: expiresAt, repositories: Array.from({ length: repositories }, () => ({ id: repositoryId, full_name: fullName, owner: { id: ownerId } })) };
   } else if (path.endsWith("/pulls/9")) {
     body = { number: 9, state: "open", draft: false, title: "Authoritative GitHub title", user: { login: "verified-author" }, head: { sha: "verified-head" } };
   } else if (path.endsWith("/comments")) {
@@ -52,6 +53,7 @@ try {
   const access = await client.authorizeRepository("501", "101");
   assert.deepEqual(requests[0].body, { repository_ids: [101] });
   assert.equal(access.token, token);
+  assert.equal(access.expiresAt, now + 3_600_000);
   assert.equal(access.repositoryOwnerId, "601");
   assert.deepEqual(await client.getPullRequest(access, 9), { state: "open", draft: false, headSha: "verified-head", prTitle: "Authoritative GitHub title", prAuthor: "verified-author" });
   await client.createCheckRun(cycle, access);
@@ -61,10 +63,12 @@ try {
 
   fullName = "Original/Renamed";
   token = "replacement-opaque-value";
+  expiresAt = new Date(now + 3_700_000).toISOString();
   const beforeRename = requests.length;
   const renamed = await client.authorizeRepository("501", "101");
   assert.equal(renamed.token, token, "the same installation and repository receive a freshly minted token");
   assert.notEqual(renamed.token, access.token);
+  assert.equal(renamed.expiresAt, now + 3_700_000, "expiry metadata belongs to the freshly minted credential");
   assert.deepEqual(requests.slice(beforeRename).map(({ path, method, body }) => ({ path, method, body })), [
     { path: "/app/installations/501/access_tokens", method: "POST", body: { repository_ids: [101] } },
   ], "authorization resolves current coordinates through one scoped grant, without a metadata GET");
@@ -95,6 +99,20 @@ try {
   nullTokenResponse = true;
   await assert.rejects(client.authorizeRepository("501", "101"), (error: unknown) => error instanceof GitHubRequestError && error.retryable && error.cause === undefined);
   nullTokenResponse = false;
+
+  for (const expiry of [undefined, null, 123, {}, "", "sensitive malformed expiry", new Date(now).toISOString(), new Date(now - 1).toISOString()]) {
+    expiresAt = expiry;
+    await assert.rejects(client.authorizeRepository("501", "101"), (error: unknown) => {
+      assert.ok(error instanceof GitHubRequestError);
+      assert.equal(error.status, null);
+      assert.equal(error.retryable, true);
+      assert.equal(error.cause, undefined);
+      assert.ok(!String(error).includes("sensitive"));
+      return true;
+    });
+  }
+  expiresAt = new Date(now + 3_600_000).toISOString();
+  assert.equal((await client.authorizeRepository("501", "101")).expiresAt, now + 3_600_000);
 
   const beforeUnsafe = requests.length;
   await assert.rejects(client.authorizeRepository("501", "9007199254740993"), GitHubAuthorizationError);

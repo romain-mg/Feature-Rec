@@ -70,7 +70,7 @@ const github = {
     if (grantError) throw grantError;
     const repositoryOwnerId = wrongOwner ? "999" : installationId === "501" ? "601" : "602";
     const [owner, repo] = currentName.split("/");
-    return { repositoryId, repositoryOwnerId, token: `scoped-${installationId}-${repositoryId}-${grantCalls}`, owner, repo, fullName: currentName };
+    return { repositoryId, repositoryOwnerId, token: `scoped-${installationId}-${repositoryId}-${grantCalls}`, expiresAt: Date.now() + 3_600_000, owner, repo, fullName: currentName };
   },
   getPullRequest: async () => { if (prError) throw prError; return { state: prState, draft, headSha: prHead, prTitle: "GitHub title", prAuthor: "github-author" }; },
   createCheckRun: async (_cycle: unknown, access: RepositoryAccess) => { record("create", access); return ++nextCheck; },
@@ -433,42 +433,54 @@ try {
     github.updateCheckRun = update;
   }
 
-  // A slow Slack upload can outlive its initial installation token. The
-  // failure check must use a fresh grant without asking the runner to reauth.
-  const expiredDeliveryToken = (await start("A", 25)).json();
-  let pendingToken: string | undefined;
-  let uploadFinished = false;
-  const failureTokens: string[] = [];
-  const grantsBeforeExpiry = grantCalls;
-  const oidcBeforeExpiry = oidcCalls;
-  github.updateCheckRun = async (cycle, details, access) => {
-    if ((await store.getCycle(expiredDeliveryToken.cycleId))?.status === "pending_validation") {
-      pendingToken = access.token;
-    } else {
-      assert.equal(uploadFinished, true);
-      if (access.token === pendingToken) throw new GitHubRequestError(401);
-      failureTokens.push(access.token);
-      assert.equal((details as { conclusion?: string }).conclusion, "failure");
+  // Only a token near/past expiry needs a fresh grant after Slack delivery.
+  // An otherwise usable token can repair the check even if minting is down.
+  for (const [prNumber, remainingMs, refresh] of [
+    [25, 3_000_000, false], [28, 60_001, false], [29, 60_000, true], [30, 0, true], [31, -1, true],
+  ] as const) {
+    const deliveryCycle = (await start("A", prNumber)).json();
+    const originalNow = Date.now;
+    let now = originalNow();
+    Date.now = () => now;
+    let pendingAccess: RepositoryAccess | undefined;
+    let uploadFinished = false;
+    const failureTokens: string[] = [];
+    const grantsBeforeExpiry = grantCalls;
+    const oidcBeforeExpiry = oidcCalls;
+    github.updateCheckRun = async (cycle, details, access) => {
+      if ((await store.getCycle(deliveryCycle.cycleId))?.status === "pending_validation") {
+        pendingAccess = access;
+      } else {
+        assert.equal(uploadFinished, true);
+        if (access.expiresAt <= Date.now()) throw new GitHubRequestError(401);
+        failureTokens.push(access.token);
+        assert.equal((details as { conclusion?: string }).conclusion, "failure");
+      }
+      return update(cycle, details, access);
+    };
+    uploadHook = async () => {
+      assert.ok(pendingAccess, "the initial token worked before upload");
+      now = pendingAccess.expiresAt - remainingMs;
+      uploadFinished = true;
+      if (!refresh) grantError = new GitHubRequestError(503);
+      throw new Error("Slack upload failed after time elapsed");
+    };
+    try {
+      const delivery = await result(deliveryCycle.cycleId, deliveryCycle.attemptId, "A", "video");
+      assert.equal(delivery.statusCode, 500);
+      assert.equal(delivery.json().settled, true);
+      assert.equal((await store.getCycle(deliveryCycle.cycleId))?.status, "failed");
+      assert.equal(grantCalls, grantsBeforeExpiry + (refresh ? 2 : 1), "cleanup only obtains fresh access within the expiry margin");
+      assert.equal(failureTokens.length, 1, "the failure check succeeds with usable access");
+      assert.ok(pendingAccess);
+      assert.equal(failureTokens[0] === pendingAccess.token, !refresh);
+      assert.equal(oidcCalls, oidcBeforeExpiry + 1, "failure cleanup does not reverify the runner's expiring OIDC token");
+    } finally {
+      Date.now = originalNow;
+      grantError = null;
+      uploadHook = undefined;
+      github.updateCheckRun = update;
     }
-    return update(cycle, details, access);
-  };
-  uploadHook = async () => {
-    assert.ok(pendingToken, "the initial token worked before upload");
-    uploadFinished = true;
-    throw new Error("upload failed after its initial installation token expired");
-  };
-  try {
-    const delivery = await result(expiredDeliveryToken.cycleId, expiredDeliveryToken.attemptId, "A", "video");
-    assert.equal(delivery.statusCode, 500);
-    assert.equal(delivery.json().settled, true);
-    assert.equal((await store.getCycle(expiredDeliveryToken.cycleId))?.status, "failed");
-    assert.equal(grantCalls, grantsBeforeExpiry + 2, "arrival and failure cleanup each obtain repository access");
-    assert.equal(failureTokens.length, 1, "the failure check succeeds with the fresh token");
-    assert.notEqual(failureTokens[0], pendingToken);
-    assert.equal(oidcCalls, oidcBeforeExpiry + 1, "failure cleanup does not reverify the runner's expiring OIDC token");
-  } finally {
-    uploadHook = undefined;
-    github.updateCheckRun = update;
   }
 
   // Losing GitHub access during delivery cannot suppress cleanup of a known
@@ -477,7 +489,11 @@ try {
     [26, new GitHubAuthorizationError(), 1], [27, new GitHubRequestError(503), 3],
   ] as const) {
     const deniedCleanup = (await start("A", prNumber)).json();
+    const originalNow = Date.now;
+    let now = originalNow();
+    Date.now = () => now;
     store.attachSlackMessage = async () => {
+      if (!grantError) now += 3_600_000;
       grantError = error;
       throw new Error("Slack attachment failed after GitHub access changed");
     };
@@ -496,6 +512,7 @@ try {
         { kind: "finalize", token: "token-A", channel: "CA", state: "failed", ts: "123.456" },
       ]);
     } finally {
+      Date.now = originalNow;
       grantError = null;
       store.attachSlackMessage = attachSlackMessage;
     }

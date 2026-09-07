@@ -145,7 +145,7 @@ function makeGithubStub() {
     identity: fixtureIdentity("T0123"),
     authorizeRepository: async (_installationId: string, repositoryId: string): Promise<RepositoryAccess> => {
       const coordinates = repositories.get(repositoryId)!;
-      return { token: "opaque-test-token", repositoryId, repositoryOwnerId: stub.identity.repositoryOwnerId, ...coordinates, fullName: `${coordinates.owner}/${coordinates.repo}` };
+      return { token: "opaque-test-token", expiresAt: Date.now() + 3_600_000, repositoryId, repositoryOwnerId: stub.identity.repositoryOwnerId, ...coordinates, fullName: `${coordinates.owner}/${coordinates.repo}` };
     },
     getPullRequest: async (_access: RepositoryAccess, prNumber: number) => {
       const start = requestedPullRequest.getStore();
@@ -867,7 +867,7 @@ try {
 
     try {
       const client = new GitHubClient(env);
-      const access: RepositoryAccess = { token: "gh-token", repositoryId: start.repositoryId, repositoryOwnerId: fixtureIdentity("T0123").repositoryOwnerId, owner: start.owner, repo: start.repo, fullName: `${start.owner}/${start.repo}` };
+      const access: RepositoryAccess = { token: "gh-token", expiresAt: Date.now() + 3_600_000, repositoryId: start.repositoryId, repositoryOwnerId: fixtureIdentity("T0123").repositoryOwnerId, owner: start.owner, repo: start.repo, fullName: `${start.owner}/${start.repo}` };
       await client.reject(cycleForGithub, "make it feel premium", access);
       await client.accept(cycleForGithub, access);
     } finally {

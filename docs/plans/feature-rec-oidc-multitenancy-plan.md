@@ -460,11 +460,13 @@ ephemeral result is:
 
 ```typescript
 type RepositoryAccess = {
-token: string;
-repositoryId: string;
-owner: string;
-repo: string;
-fullName: string;
+  token: string;
+  expiresAt: number;
+  repositoryId: string;
+  repositoryOwnerId: string;
+  owner: string;
+  repo: string;
+  fullName: string;
 };
 ```
 
@@ -481,11 +483,14 @@ Then make check-run/comment methods accept `RepositoryAccess` rather than
 looking up a token from stored names. Remove the name-keyed installation-token
 cache and mint fresh repository-scoped access for each logical operation. The
 token response supplies current repository metadata for validation and REST
-coordinates. After potentially long Slack delivery, reacquire cycle-bound
-repository access before the failure-path check update: even a newly minted
-token can expire during delivery. Keep Slack cleanup independent if that fresh
-authorization fails. Never automatically replay a comment POST when recovering
-credentials.
+coordinates. Retain the response's validated expiry as epoch milliseconds in
+the request's access object. Before the video failure-path check update, reuse
+that access if more than 60 seconds remain; otherwise reacquire cycle-bound
+access. The margin covers bounded GitHub retries after a potentially long Slack
+upload. Reuse does not refresh installation status or repository metadata during
+the request, and expiry alone does not establish non-revocation. Keep Slack
+cleanup independent if fresh authorization fails. Never automatically replay a
+comment POST when recovering credentials.
 
 Keep the token opaque: GitHub installation-token formats may change, and code
 must not inspect length or prefix.
@@ -1056,8 +1061,12 @@ attachment races preserve their existing semantics.
   installation/repository pair; a previous grant cannot hide a later rejection.
 - Grant denials, provider outages, rate limits, and malformed responses retain
   their safe error mapping, including after an earlier successful grant.
-- Video failure cleanup obtains fresh access after a long Slack upload; failed
-  reauthorization leaves the stored failure and independent Slack cleanup intact.
+- Video failure cleanup reuses request-local access above the 60-second expiry
+  margin even if minting is unavailable, and obtains fresh access at/below the
+  margin. Failed reauthorization leaves the stored failure and independent
+  Slack cleanup intact.
+- Grant expiry must be a valid future timestamp; missing/malformed/expired
+  expiry responses produce a safe provider error.
 - Current full name is used for REST coordinates.
 - Repository rename between operations uses the new name.
 - Transfer to an unauthorized owner fails; later authorization under a different
@@ -1395,11 +1404,23 @@ repositories; it must report and stop rather than guess or silently delete.
 - User decision: remove the installation-token cache. Its live metadata lookup
   replaced a mint with another GitHub request and introduced expiry and eviction
   handling. Each logical operation now mints fresh repository-scoped access.
-- Resolved: video failure cleanup previously reused access obtained before an
-  unbounded Slack upload. It now reacquires access for the cycle before updating
-  the check; regression coverage simulates expiry during delivery and failed
-  reauthorization without blocking independent Slack cleanup.
+- Resolved, then refined below: video failure cleanup previously reused access
+  obtained before an unbounded Slack upload. The initial fix reacquired access
+  for the cycle before updating the check; regression coverage simulated expiry
+  during delivery and failed reauthorization without blocking Slack cleanup.
 - Coverage follows the remaining paths: repeated grants, rejection after prior
   success, safe provider failures, and recovery. Cache-listing `total_count` and
   post-eviction cases no longer exist. Same-request content-mismatch reminting
   and concurrent duplicate-mint optimization are explicitly out of scope.
+
+## PR B request-local expiry refinement (2026-09-07)
+
+- User decision: avoid unconditional token minting during video failure cleanup.
+  Retain the grant's validated expiry within the request, reuse access while more
+  than 60 seconds remain, and reacquire otherwise. There is no shared token cache.
+- Accepted tradeoff: reuse does not recheck installation status or refresh
+  repository metadata during delivery. It avoids making cleanup depend on a
+  fresh mint while the original access still has sufficient remaining lifetime.
+- Regression coverage includes healthy-token reuse during a mint outage, both
+  sides of the expiry margin, expiry during delivery, invalid grant expiry, and
+  failed reacquisition with independent Slack cleanup.
