@@ -46,6 +46,8 @@ just before any state change. OIDC/provider authorization and PR reads make up t
 on transient failures; mutation endpoints are never replayed wholesale. Provider rate-limit waits return `503`
 with `Retry-After`. Invalid JWTs return `401` with a safe reason category in service logs; denied grants
 return `403`, while permanent GitHub API errors return `502`.
+GitHub secondary rate limits are also recognized from their error category when headers are absent;
+without a usable provider delay, the service returns `Retry-After: 60`.
 
 A failed GitHub approval check leaves the cycle pending and replies to a button click ephemerally.
 Modal authorization has a two-second deadline; errors and timeouts keep the comment in the modal for

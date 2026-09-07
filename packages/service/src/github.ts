@@ -134,16 +134,25 @@ async function githubFetch<T>(
     body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
   }).catch(() => { throw new GitHubRequestError(null); });
   if (!response.ok) {
-    const rateLimited = response.status === 403 && (response.headers.get("x-ratelimit-remaining") === "0" || response.headers.has("retry-after"));
-    // Never include response bodies or request headers: they may contain credentials.
-    await response.body?.cancel().catch(() => undefined);
+    let secondaryRateLimited = false;
+    if (response.status === 403 || response.status === 429) {
+      // Secondary limits may omit Retry-After while primary quota remains.
+      // Inspect the category only; provider messages and JSON parse errors can
+      // contain credentials and must never escape through an error or its cause.
+      const body: unknown = await response.json().catch(() => undefined);
+      secondaryRateLimited = !!body && typeof body === "object" && "message" in body &&
+        typeof body.message === "string" && /\bsecondary rate limit\b/i.test(body.message);
+    } else {
+      await response.body?.cancel().catch(() => undefined);
+    }
+    const rateLimited = response.status === 403 && (secondaryRateLimited || response.headers.get("x-ratelimit-remaining") === "0" || response.headers.has("retry-after"));
     const retryAfter = response.headers.get("retry-after");
     const reset = response.headers.get("x-ratelimit-reset");
     const retrySeconds = retryAfter !== null
       ? (/^\d+$/.test(retryAfter) ? Number(retryAfter) : (Date.parse(retryAfter) - Date.now()) / 1_000)
       : response.headers.get("x-ratelimit-remaining") === "0" && reset !== null ? Number(reset) - Date.now() / 1_000 : NaN;
     throw new GitHubRequestError(response.status, rateLimited || response.status === 429 || response.status >= 500,
-      Number.isFinite(retrySeconds) ? Math.max(0, Math.ceil(retrySeconds)) : null);
+      Number.isFinite(retrySeconds) ? Math.max(0, Math.ceil(retrySeconds)) : secondaryRateLimited ? 60 : null);
   }
   try {
     return (await response.json()) as T;

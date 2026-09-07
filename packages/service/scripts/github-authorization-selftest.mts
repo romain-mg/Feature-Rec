@@ -24,6 +24,7 @@ let failTokenStatus = 0;
 let nullTokenResponse = false;
 let commentFails = false;
 let tokenFailureHeaders: Record<string, string> = {};
+let tokenFailureBody = "provider credential details must stay private";
 let patchFailures = 0;
 const cycle: CycleRecord = {
   id: "cycle", tenantId: "tenant", repositoryId: "101", cycleKey: "tenant/101#9:headsha",
@@ -36,7 +37,7 @@ globalThis.fetch = async (url, init) => {
   let body: unknown = {};
   if (path.endsWith("/access_tokens")) {
     if (nullTokenResponse) return Response.json(null);
-    if (failTokenStatus) return new Response("provider credential details must stay private", { status: failTokenStatus, headers: tokenFailureHeaders });
+    if (failTokenStatus) return new Response(tokenFailureBody, { status: failTokenStatus, headers: tokenFailureHeaders });
     body = { token, expires_at: expiresAt, repositories: Array.from({ length: repositories }, () => ({ id: repositoryId, full_name: fullName, owner: { id: ownerId } })) };
   } else if (path.endsWith("/pulls/9")) {
     body = { number: 9, state: "open", draft: false, title: "Authoritative GitHub title", user: { login: "verified-author" }, head: { sha: "verified-head" } };
@@ -167,6 +168,43 @@ try {
       return true;
     });
     assert.equal(requests.length - beforeRateLimit, 1, "rate limits fail without stale access fallback");
+  }
+  // Secondary limits can leave primary quota available and omit Retry-After.
+  // They must remain retryable instead of becoming repository access denials.
+  tokenFailureBody = JSON.stringify({ message: "You have exceeded a secondary rate limit. private-provider-detail" });
+  for (const status of [403, 429]) {
+    for (const { headers, seconds } of [
+      { headers: { "x-ratelimit-remaining": "4999" }, seconds: 60 },
+      { headers: {}, seconds: 60 },
+      { headers: { "retry-after": "120" }, seconds: 120 },
+      { headers: { "retry-after": "invalid" }, seconds: 60 },
+      { headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(Math.floor(now / 1_000) + 90) }, seconds: 90 },
+    ]) {
+      failTokenStatus = status;
+      tokenFailureHeaders = headers;
+      const beforeRateLimit = requests.length;
+      await assert.rejects(client.authorizeRepository("501", "101"), (error: unknown) => {
+        assert.ok(error instanceof GitHubRequestError);
+        assert.equal(error.status, status);
+        assert.equal(error.retryable, true);
+        assert.equal(error.retryAfterSeconds, seconds);
+        assert.equal(error.cause, undefined);
+        assert.ok(!String(error).includes("private-provider-detail"));
+        return true;
+      });
+      assert.equal(requests.length - beforeRateLimit, 1, "secondary limits do not retry immediately or reuse old access");
+    }
+  }
+  failTokenStatus = 403;
+  tokenFailureHeaders = {};
+  for (const body of ["private-provider-detail", "null", "42", JSON.stringify({ message: 42 }), JSON.stringify({ message: "Resource not accessible by integration. private-provider-detail" })]) {
+    tokenFailureBody = body;
+    await assert.rejects(client.authorizeRepository("501", "101"), (error: unknown) => {
+      assert.ok(error instanceof GitHubAuthorizationError, "ordinary or malformed 403 responses remain access denials");
+      assert.ok(!String(error).includes("private-provider-detail"));
+      assert.equal(error.cause, undefined);
+      return true;
+    });
   }
   tokenFailureHeaders = {};
   failTokenStatus = 0;
