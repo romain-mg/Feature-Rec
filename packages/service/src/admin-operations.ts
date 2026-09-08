@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import type { Kysely, Transaction } from "kysely";
 import { sql } from "kysely";
-import { buildCycleKey, buildTenantCycleKey } from "@feature-rec/core";
+import { buildLegacyCycleKey, buildTenantCycleKey } from "@feature-rec/core";
 import { GitHubRequestError, type GitHubRepositoryIdentity } from "./github";
 import { encryptSlackToken } from "./slack-token-crypto";
 import type { DB } from "./storage/schema";
@@ -729,7 +729,7 @@ export async function prepareRollbackToA(input: {
       issues.push(`review cycle ${cycle.id} lacks rollback-compatible owner/repo values`);
       continue;
     }
-    const key = buildCycleKey({
+    const key = buildLegacyCycleKey({
       owner: cycle.owner,
       repo: cycle.repo,
       prNumber: cycle.pr_number,
@@ -749,7 +749,7 @@ export async function prepareRollbackToA(input: {
       await trx
         .updateTable("review_cycles")
         .set({
-          cycle_key: buildCycleKey({
+          cycle_key: buildLegacyCycleKey({
             owner: cycle.owner!,
             repo: cycle.repo!,
             prNumber: cycle.pr_number,

@@ -211,7 +211,7 @@ Enable GitHub Autodeploys on the backend Railway service for the protected `main
 
 ### Documentation
 
-Update `README.md` and `docs/feature-rec.md` with:
+Update `README.md` and `docs/setup-and-operations.md` with:
 
 - production build and local image commands;
 - the environment-variable contract;

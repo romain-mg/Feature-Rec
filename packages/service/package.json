@@ -11,10 +11,11 @@
     "dev": "tsx src/index.ts",
     "start": "node --enable-source-maps dist/index.js",
     "typecheck": "tsc --noEmit",
-    "selftest": "tsx scripts/admin-input-selftest.mts && tsx scripts/selftest.mts && tsx scripts/admin-selftest.mts"
+    "selftest": "tsx scripts/oidc-selftest.mts && tsx scripts/github-authorization-selftest.mts && tsx scripts/admin-input-selftest.mts && tsx scripts/selftest.mts && tsx scripts/storage-selftest.mts && tsx scripts/http-multitenancy-selftest.mts && tsx scripts/slack-multitenancy-selftest.mts && tsx scripts/admin-selftest.mts"
   },
   "dependencies": {
     "fastify": "^5.8.5",
+    "jose": "^6.2.11",
     "kysely": "^0.29.3",
     "pg": "^8.22.0",
     "zod": "^3.23.8"

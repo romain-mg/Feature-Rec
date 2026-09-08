@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import type { SlackApprovalPayload } from "@feature-rec/core";
-import type { ServiceEnv } from "./env";
 import type { CycleRecord } from "./storage";
 
 type SlackResponse<T> = T & {
@@ -31,34 +30,44 @@ function timingSafeStringEqual(left: string, right: string): boolean {
   );
 }
 
+export class SlackApiError extends Error {
+  constructor(readonly code: string, message: string) { super(message); }
+}
+
+export function isRevokedSlackToken(error: unknown): boolean {
+  // invalid_auth can also mean an IP allowlist rejection. It does not prove
+  // that the current credential was revoked and must never authorize deletion.
+  return error instanceof SlackApiError && ["token_revoked", "account_inactive"].includes(error.code);
+}
+
 async function slackApi<T>(
-  env: ServiceEnv,
+  botToken: string,
   method: string,
   body: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<T> {
-  if (!env.slackBotToken) throw new Error("SLACK_BOT_TOKEN is not set.");
   const response = await fetch(`https://slack.com/api/${method}`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${env.slackBotToken}`,
+      Authorization: `Bearer ${botToken}`,
       "Content-Type": "application/json; charset=utf-8",
     },
     body: JSON.stringify(body),
+    signal,
   });
   return readSlackResponse<T>(method, response);
 }
 
 async function slackApiGet<T>(
-  env: ServiceEnv,
+  botToken: string,
   method: string,
   query: Record<string, string | number>,
 ): Promise<T> {
-  if (!env.slackBotToken) throw new Error("SLACK_BOT_TOKEN is not set.");
   const url = new URL(`https://slack.com/api/${method}`);
   Object.entries(query).forEach(([key, value]) => url.searchParams.set(key, String(value)));
   const response = await fetch(url, {
     method: "GET",
-    headers: { Authorization: `Bearer ${env.slackBotToken}` },
+    headers: { Authorization: `Bearer ${botToken}` },
   });
   return readSlackResponse<T>(method, response);
 }
@@ -68,7 +77,7 @@ async function readSlackResponse<T>(method: string, response: Response): Promise
   if (!json.ok) {
     const details = json.response_metadata?.messages?.filter(Boolean).join("; ");
     const reason = json.error ?? response.statusText;
-    throw new Error(`Slack ${method} failed: ${reason}${details ? ` (${details})` : ""}`);
+    throw new SlackApiError(json.error ?? "unknown", `Slack ${method} failed: ${reason}${details ? ` (${details})` : ""}`);
   }
   return json as T;
 }
@@ -91,12 +100,25 @@ export function verifySlackSignature(input: {
   return timingSafeStringEqual(digest, input.signature);
 }
 
+// A response URL comes only from a verified Slack payload. Replying does not
+// require an installed workspace or a decrypted bot token.
+export async function respondEphemeral(responseUrl: string, text: string): Promise<void> {
+  const response = await fetch(responseUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ response_type: "ephemeral", replace_original: false, text }),
+  });
+  if (!response.ok) {
+    throw new Error(`Slack response_url reply failed: ${response.status} ${await response.text()}`);
+  }
+}
+
 function actionValue(payload: SlackApprovalPayload): string {
   return JSON.stringify(payload);
 }
 
-function validationBlocks(cycle: CycleRecord, mention: string | null): unknown[] {
-  const title = `Feature-Rec validation needed for ${cycle.owner}/${cycle.repo}#${cycle.prNumber}`;
+function validationBlocks(cycle: CycleRecord, mention: string | null, fullName: string): unknown[] {
+  const title = `Feature-Rec validation needed for ${fullName}#${cycle.prNumber}`;
   const body = `*${title}*\n${cycle.prTitle || "Frontend-visible change detected."}`;
   return [
     {
@@ -153,20 +175,21 @@ type ConversationMembersPage = {
 };
 
 export class SlackClient {
-  #env: ServiceEnv;
+  #botToken: string;
   #identity: Promise<BotIdentity> | null = null;
 
-  constructor(env: ServiceEnv) {
-    this.#env = env;
+  constructor(botToken: string) {
+    if (!botToken) throw new Error("Slack bot token must not be empty");
+    this.#botToken = botToken;
   }
 
-  // Cached for the process lifetime: the bot token's identity never changes
-  // while the token is valid. Failures clear the cache so the next call retries.
-  botIdentity(): Promise<BotIdentity> {
+  // Identity is checked for provisioning and lifecycle revocation checks.
+  // Ordinary runtime operations use the persisted bot user ID.
+  botIdentity(timeoutMs = 5_000): Promise<BotIdentity> {
     this.#identity ??= slackApi<{
       user_id: string;
       team_id: string;
-    }>(this.#env, "auth.test", {}).then(
+    }>(this.#botToken, "auth.test", {}, AbortSignal.timeout(timeoutMs)).then(
       (res) => ({
         userId: res.user_id,
         teamId: res.team_id,
@@ -189,7 +212,7 @@ export class SlackClient {
     const channelIds: string[] = [];
     let cursor: string | undefined;
     do {
-      const page = await slackApi<ConversationsPage>(this.#env, "users.conversations", {
+      const page = await slackApi<ConversationsPage>(this.#botToken, "users.conversations", {
         types: "public_channel,private_channel",
         exclude_archived: true,
         limit: 200,
@@ -208,7 +231,7 @@ export class SlackClient {
     let cursor: string | undefined;
     do {
       const page = await slackApiGet<ConversationMembersPage>(
-        this.#env,
+        this.#botToken,
         "conversations.members",
         {
           channel: channelId,
@@ -225,7 +248,7 @@ export class SlackClient {
   async listUsergroups(): Promise<SlackUsergroup[]> {
     const res = await slackApi<{
       usergroups?: Array<{ id: string; handle: string }>;
-    }>(this.#env, "usergroups.list", { include_disabled: false });
+    }>(this.#botToken, "usergroups.list", { include_disabled: false });
     return (res.usergroups ?? []).map((group) => ({
       id: group.id,
       handle: group.handle,
@@ -233,7 +256,7 @@ export class SlackClient {
   }
 
   async listUsergroupMembers(usergroupId: string): Promise<string[]> {
-    const res = await slackApi<{ users?: string[] }>(this.#env, "usergroups.users.list", {
+    const res = await slackApi<{ users?: string[] }>(this.#botToken, "usergroups.users.list", {
       usergroup: usergroupId,
       include_disabled: false,
     });
@@ -241,34 +264,25 @@ export class SlackClient {
   }
 
   async postMessage(channelId: string, text: string): Promise<void> {
-    await slackApi(this.#env, "chat.postMessage", { channel: channelId, text });
+    await slackApi(this.#botToken, "chat.postMessage", { channel: channelId, text });
   }
 
   // response_url replies bypass the Web API: they are short-lived webhook URLs
   // scoped to the triggering interaction.
   async respondEphemeral(responseUrl: string, text: string): Promise<void> {
-    const response = await fetch(responseUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ response_type: "ephemeral", replace_original: false, text }),
-    });
-    if (!response.ok) {
-      throw new Error(`Slack response_url reply failed: ${response.status} ${await response.text()}`);
-    }
+    await respondEphemeral(responseUrl, text);
   }
 
-  async uploadVideo(cycle: CycleRecord, channelId: string, file: Buffer): Promise<void> {
-    if (!this.#env.slackBotToken) throw new Error("SLACK_BOT_TOKEN is not set.");
-    const params = new URLSearchParams({
+  async uploadVideo(
+    cycle: CycleRecord,
+    channelId: string,
+    file: Buffer,
+    fullName: string,
+  ): Promise<void> {
+    const upload = await slackApiGet<{ upload_url: string; file_id: string }>(this.#botToken, "files.getUploadURLExternal", {
       filename: `feature-rec-${cycle.prNumber}-${cycle.headSha.slice(0, 8)}.mp4`,
-      length: String(file.byteLength),
+      length: file.byteLength,
     });
-    const uploadUrlResp = await fetch(`https://slack.com/api/files.getUploadURLExternal?${params}`, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${this.#env.slackBotToken}` },
-    });
-    const upload = await uploadUrlResp.json() as { ok: boolean; upload_url: string; file_id: string; error?: string };
-    if (!upload.ok) throw new Error(`Slack files.getUploadURLExternal failed: ${upload.error}`);
 
     const uploadResponse = await fetch(upload.upload_url, {
       method: "POST",
@@ -276,13 +290,15 @@ export class SlackClient {
       body: new Blob([new Uint8Array(file)]),
     });
     if (!uploadResponse.ok) {
+      // This upload URL reports HTTP status, not Web API error codes. A failed
+      // upload does not establish that the workspace token was revoked.
       throw new Error(`Slack file upload failed: ${uploadResponse.status} ${await uploadResponse.text()}`);
     }
 
-    await slackApi(this.#env, "files.completeUploadExternal", {
+    await slackApi(this.#botToken, "files.completeUploadExternal", {
       files: [{ id: upload.file_id, title: `Feature-Rec PR #${cycle.prNumber}` }],
       channel_id: channelId,
-      initial_comment: `Feature-Rec video for ${cycle.owner}/${cycle.repo}#${cycle.prNumber}`,
+      initial_comment: `Feature-Rec video for ${fullName}#${cycle.prNumber}`,
     });
   }
 
@@ -290,11 +306,12 @@ export class SlackClient {
     cycle: CycleRecord,
     channelId: string,
     mention: string | null,
+    fullName: string,
   ): Promise<{ channel: string; ts: string }> {
-    const message = await slackApi<{ channel: string; ts: string }>(this.#env, "chat.postMessage", {
+    const message = await slackApi<{ channel: string; ts: string }>(this.#botToken, "chat.postMessage", {
       channel: channelId,
-      text: `Feature-Rec validation needed for ${cycle.owner}/${cycle.repo}#${cycle.prNumber}`,
-      blocks: validationBlocks(cycle, mention),
+      text: `Feature-Rec validation needed for ${fullName}#${cycle.prNumber}`,
+      blocks: validationBlocks(cycle, mention, fullName),
     });
     return { channel: message.channel, ts: message.ts };
   }
@@ -316,14 +333,14 @@ export class SlackClient {
 
   async finalize(
     cycle: CycleRecord,
-    state: "accepted" | "rejected" | "superseded",
+    state: "accepted" | "rejected" | "superseded" | "failed",
     detail: string,
   ): Promise<void> {
     if (!cycle.slackChannelId || !cycle.slackMessageTs) return;
-    await slackApi(this.#env, "chat.update", {
+    await slackApi(this.#botToken, "chat.update", {
       channel: cycle.slackChannelId,
       ts: cycle.slackMessageTs,
-      text: `Feature-Rec ${state} for ${cycle.owner}/${cycle.repo}#${cycle.prNumber}`,
+      text: `Feature-Rec ${state} for PR #${cycle.prNumber}`,
       blocks: [
         {
           type: "section",
@@ -345,7 +362,7 @@ export class SlackClient {
     cycle: CycleRecord,
     responseUrl: string | undefined,
   ): Promise<void> {
-    await slackApi(this.#env, "views.open", {
+    await slackApi(this.#botToken, "views.open", {
       trigger_id: triggerId,
       view: {
         type: "modal",

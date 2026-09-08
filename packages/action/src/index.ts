@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
-import { isAllowedPullRequestEvent, SLACK_NO_CHANNEL_MESSAGE } from "@feature-rec/core";
+import { isAllowedPullRequestEvent, normalizeOidcAudience, SLACK_NO_CHANNEL_MESSAGE } from "@feature-rec/core";
 import { renderFeatureRecVideo } from "@autodemo/cli/feature-rec";
 import { acceptCycle, failCycle, SettledBackendError, startCycle, uploadVideo } from "./backend";
 import { classifyFrontendVisible } from "./classifier";
@@ -13,16 +13,11 @@ class OnboardingRequiredError extends Error {}
 
 type PullRequestEvent = {
   action?: string;
-  repository: {
-    name: string;
-    owner: { login: string };
-  };
   pull_request: {
     number: number;
     state: string;
     draft: boolean;
     title: string;
-    user: { login: string };
     base: { sha: string };
     head: { sha: string };
   };
@@ -37,8 +32,9 @@ function arg(name: string, fallback = ""): string {
 async function main(): Promise<void> {
   const repoRoot = path.resolve(arg("--repo", process.cwd()));
   const eventPath = path.resolve(arg("--event", process.env.GITHUB_EVENT_PATH ?? ""));
-  const apiUrl = arg("--api-url", process.env.FEATURE_REC_API_URL ?? "").replace(/\/$/, "");
-  if (!apiUrl) throw new Error("Missing Feature-Rec api-url.");
+  const apiUrl = normalizeOidcAudience(arg("--api-url", process.env.FEATURE_REC_API_URL ?? ""), {
+    allowLoopbackHttp: process.env.NODE_ENV === "development" || process.env.NODE_ENV === "test",
+  });
   if (!eventPath || !fs.existsSync(eventPath)) throw new Error("Missing GITHUB_EVENT_PATH.");
 
   const event = JSON.parse(fs.readFileSync(eventPath, "utf8")) as PullRequestEvent;
@@ -47,18 +43,16 @@ async function main(): Promise<void> {
     return;
   }
 
-  const owner = event.repository.owner.login;
-  const repo = event.repository.name;
   const pr = event.pull_request;
   const started = await startCycle(apiUrl, {
-    owner,
-    repo,
     prNumber: pr.number,
-    prTitle: pr.title,
-    prAuthor: pr.user.login,
     headSha: pr.head.sha,
-    baseSha: pr.base.sha,
   });
+
+  if (started.skipped) {
+    console.log(`Feature-Rec skipped: ${started.reason}.`);
+    return;
+  }
 
   // Same-head duplicate: another runner already owns this cycle. Exit cleanly
   // before any work so no duplicate check runs, video uploads, or Slack posts.
@@ -117,8 +111,8 @@ async function main(): Promise<void> {
     });
     await uploadVideo(apiUrl, started.cycleId, video, attemptId);
   } catch (err) {
-    // Backend-settled failures already carry an actionable check-run message;
-    // reporting again would overwrite it with a generic stack trace.
+    // The backend already committed this failure and attempted provider cleanup;
+    // a second failure report cannot repair an already-settled cycle.
     if (err instanceof SettledBackendError) {
       console.error(`Feature-Rec: ${err.message}`);
       throw err;
@@ -129,7 +123,11 @@ async function main(): Promise<void> {
         : err instanceof Error
           ? err.stack ?? err.message
           : String(err);
-    await failCycle(apiUrl, started.cycleId, message, attemptId);
+    try {
+      await failCycle(apiUrl, started.cycleId, message, attemptId);
+    } catch (reportError) {
+      console.error("Feature-Rec could not report the failure to the backend:", reportError);
+    }
     throw err;
   }
 }

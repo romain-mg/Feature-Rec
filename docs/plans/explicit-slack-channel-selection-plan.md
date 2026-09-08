@@ -76,7 +76,7 @@ Slack messages.
 - `packages/service/scripts/selftest.mts` is the integration-style Postgres test
 suite covering membership ordering, promotion, commands, video delivery, and
 approval gates.
-- `README.md` and `docs/feature-rec.md` document the current oldest-channel queue.
+- `README.md` and `docs/setup-and-operations.md` document the current oldest-channel queue.
 
 ## Target data model
 
@@ -578,7 +578,7 @@ Update:
 
 - `README.md`: replace oldest-channel/failover onboarding language with explicit
 selection and the new command.
-- `docs/feature-rec.md`: update onboarding, command table, event behavior, status
+- `docs/setup-and-operations.md`: update onboarding, command table, event behavior, status
 output, no-channel recovery, and smoke checks.
 - `docs/plans/seamless-slack-onboarding-plan.md`: add a short “superseded routing
 behavior” note linking to this plan; keep the rest as historical design context.
@@ -614,7 +614,7 @@ production rollout.
 | 5   | Add `/feature-rec channel`, shared command context, selected-channel settings lookup, and membership validation                                          | `http.ts`                                                                                                 |
 | 6   | Make later joins silent, delete leave-event handling, and remove all queue greetings/promotion notices                                                   | `http.ts`, core constants                                                                                 |
 | 7   | Replace queue/failover tests and add route, command, membership, race, and regression coverage                                                           | service/core selftests                                                                                    |
-| 8   | Update README and Slack setup/operations documentation                                                                                                   | `README.md`, `docs/feature-rec.md`, prior plan note                                                       |
+| 8   | Update README and Slack setup/operations documentation                                                                                                   | `README.md`, `docs/setup-and-operations.md`, prior plan note                                                       |
 | 9   | Run formatting/lint, typecheck, full selftests, and a staging Slack smoke test                                                                           | repository-wide                                                                                           |
 | 10  | After the rollback window closes, drop the legacy membership table and remove its schema type in a separate cleanup PR                                   | new cleanup migration, `storage/schema.ts`                                                                |
 
