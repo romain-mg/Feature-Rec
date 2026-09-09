@@ -292,7 +292,7 @@ export function buildServer(input: {
     const cycleKey = buildCycleKey({ tenantId, repositoryId, ...start });
     const result = await store.startCycle({
       ...start, tenantId, repositoryId, cycleKey,
-      prTitle: pr.prTitle, prAuthor: pr.prAuthor, owner: access.owner, repo: access.repo,
+      prTitle: pr.prTitle, prAuthor: pr.prAuthor,
     });
 
     // Duplicate start for the same head: clean no-op exit. No check run is

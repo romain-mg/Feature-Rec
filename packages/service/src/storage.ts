@@ -6,12 +6,10 @@ export type CycleRecord = ReviewCycle & {
 };
 
 // Identity and PR metadata are supplied by verified GitHub access, never by
-// the public runner payload. Names are written only for the rollback window.
+// the public runner payload.
 export type StartCycleInput = {
   tenantId: string;
   repositoryId: string;
-  owner: string;
-  repo: string;
   prNumber: number;
   headSha: string;
   prAuthor: string;

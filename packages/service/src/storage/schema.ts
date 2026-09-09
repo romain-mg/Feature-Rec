@@ -1,23 +1,17 @@
 import type { ColumnType } from "kysely";
 import type { ReviewCycleStatus } from "@feature-rec/core";
 
+// Legacy columns (owner, repo, config_json, config_hash) physically remain
+// until the 0010 contract migration but are absent here so no code path can
+// read or write them.
 export interface ReviewCyclesTable {
   id: string;
   cycle_key: string;
-  owner: string | null;
-  repo: string | null;
-  tenant_id: ColumnType<string | null, string | null | undefined, string | null>;
-  repository_id: ColumnType<
-    string | null,
-    string | null | undefined,
-    string | null
-  >;
+  tenant_id: string;
+  repository_id: string;
   pr_number: number;
   pr_author: string;
   pr_title: string;
-  // Legacy config columns: never written anymore, nullable until dropped.
-  config_json: ColumnType<string | null, never, never>;
-  config_hash: ColumnType<string | null, never, never>;
   head_sha: string;
   status: ReviewCycleStatus;
   attempt_id: string;
@@ -45,11 +39,6 @@ export interface ChannelSettingsTable {
   updated_at: ColumnType<Date, string, string>;
 }
 
-export interface TeamChannelRoutesTable {
-  team_id: string;
-  selected_channel_id: string;
-}
-
 export interface TenantsTable {
   id: string;
   enabled: ColumnType<boolean, boolean | undefined, boolean>;
@@ -73,7 +62,6 @@ export interface DB {
   review_cycles: ReviewCyclesTable;
   processed_interactions: ProcessedInteractionsTable;
   channel_settings: ChannelSettingsTable;
-  team_channel_routes: TeamChannelRoutesTable;
   tenants: TenantsTable;
   slack_workspaces: SlackWorkspacesTable;
   slack_token_encryption_key: { id: number; verifier: string };

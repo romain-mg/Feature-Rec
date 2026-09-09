@@ -1,8 +1,6 @@
 import assert from "node:assert/strict";
 import {
   buildCycleKey,
-  buildTenantCycleKey,
-  buildLegacyCycleKey,
   normalizeOidcAudience,
   RunStartRequestSchema,
   RunStartResponseSchema,
@@ -36,8 +34,6 @@ assert.equal(
   }),
   "tenant-a/9223372036854775807#7:abc1234",
 );
-assert.equal(buildTenantCycleKey, buildCycleKey);
-assert.equal(buildLegacyCycleKey({ owner: "o", repo: "r", prNumber: 7, headSha: "abc1234" }), "o/r#7:abc1234");
 assert.notEqual(
   buildCycleKey({ tenantId: "a", repositoryId: "1", prNumber: 7, headSha: "abc1234" }),
   buildCycleKey({ tenantId: "b", repositoryId: "1", prNumber: 7, headSha: "abc1234" }),
@@ -54,7 +50,7 @@ for (const reason of ["closed", "draft", "stale_head"]) {
   assert.deepEqual(RunStartResponseSchema.parse({ skipped: true, reason }), { skipped: true, reason });
 }
 assert.equal(
-  buildTenantCycleKey({
+  buildCycleKey({
     tenantId: "c647960e-af6a-42d3-a7e5-49c258fa5a11",
     repositoryId: "9007199254740991",
     prNumber: 7,

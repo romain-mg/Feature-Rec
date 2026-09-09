@@ -1,26 +1,29 @@
 # Multitenancy Notes
 
-## Current contract after deploy B
+## Current contract after deploy C
 
 The singleton designs below are historical and are superseded by the
 [OIDC and multitenancy plan](plans/feature-rec-oidc-multitenancy-plan.md).
 Tenants are UUID product boundaries, each with one GitHub account/installation and one Slack workspace.
 All runner calls verify GitHub OIDC, resolve the enabled tenant, and mint a live repository-scoped
 installation token. Cycles, locks, supersession, and guarded transitions use tenant/repository IDs.
-Repository names are transient GitHub coordinates, with legacy compatibility writes retained only
-for B's qualified singleton rollback window.
+Repository names are transient GitHub coordinates only: deploy C stopped every legacy read/write, so
+new cycles carry no `owner`/`repo` values and nothing touches `team_channel_routes`. The physical
+legacy columns and table remain, inert, until the deploy-D contract drops them.
 
 Every Slack Web API operation uses the token decrypted from the selected workspace row. Signed
 workspace IDs have no global fallback, and approval payloads must match the cycle tenant's workspace.
 The persisted bot user ID is refreshed by provisioning `auth.test`; normal membership events compare
-it before decrypting or calling Slack. `slack_workspaces.selected_channel_id` owns routing. B keeps
-legacy route dual writes, but does not read legacy rows as runtime authority. Lifecycle deletion
-explicitly removes team settings and disables the tenant even before the later cascade migration.
+it before decrypting or calling Slack. `slack_workspaces.selected_channel_id` owns routing. Lifecycle
+deletion explicitly removes team settings and disables the tenant; since `0009_multitenant_enforce`,
+the `channel_settings_team_id_fkey` `ON DELETE CASCADE` also backstops that cleanup at the database.
 
 The A/B/C/D release boundaries remain separate: expand, cut over, enforce/stop legacy writes, then
-contract. B registers no migration beyond `0008`. Later schema rollback must run the newer artifact's
-targeted down migration before starting the older artifact. B-to-A is limited to a validated
-singleton or a pre-cutover restore. See the [cutover and rollback runbook](setup-and-operations.md#oidc-cutover-checklist).
+contract. Deploy C registers `0009_multitenant_enforce` (`NOT NULL` review-cycle identity plus the
+cascade FK). Later schema rollback must run the newer artifact's targeted down migration before
+starting the older artifact: C-to-B migrates down to `0008` with C's admin artifact. B-to-A was
+limited to a validated singleton; once deploy C has written cycles, recovering to A means restoring
+the pre-cutover backup. See the [cutover and rollback runbook](setup-and-operations.md#oidc-cutover-checklist).
 
 ## Historical singleton notes
 
@@ -147,5 +150,7 @@ Safe deployment order:
 3. Add multitenant plumbing without exposing GitHub routing under legacy auth.
 4. Add OIDC plus installation authorization and cut the action/backend over as
    one release; switch cycle identity, locks, and supersession atomically.
-5. Observe and reconcile; enforce the new non-null invariants.
+5. Observe and reconcile; enforce the new non-null invariants. (Landed as
+   deploy C / `0009_multitenant_enforce`.)
 6. In a later contract deployment, remove legacy columns, tables, and secrets.
+   (Deploy D, pending.)

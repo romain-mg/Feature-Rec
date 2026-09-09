@@ -28,7 +28,7 @@ let tokenFailureBody = "provider credential details must stay private";
 let patchFailures = 0;
 const cycle: CycleRecord = {
   id: "cycle", tenantId: "tenant", repositoryId: "101", cycleKey: "tenant/101#9:headsha",
-  owner: "Wrong", repo: "Legacy", prNumber: 9, headSha: "headsha", prAuthor: "author", prTitle: "Title",
+  prNumber: 9, headSha: "headsha", prAuthor: "author", prTitle: "Title",
   checkRunId: 55, status: "pending_validation", slackChannelId: "CA", slackMessageTs: "1.1", createdAt: "", updatedAt: "",
 };
 globalThis.fetch = async (url, init) => {

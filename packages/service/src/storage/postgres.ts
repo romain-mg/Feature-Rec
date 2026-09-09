@@ -35,18 +35,12 @@ function now(): string {
 }
 
 function rowToCycle(row: Selectable<ReviewCyclesTable>): CycleRecord {
-  if (row.tenant_id === null || row.repository_id === null) {
-    throw new Error(
-      `Review cycle ${row.id} has no authenticated tenant/repository identity; complete backfill before cutover`,
-    );
-  }
   return {
     id: row.id,
     cycleKey: row.cycle_key,
     tenantId: row.tenant_id,
-    repositoryId: String(row.repository_id),
-    owner: row.owner,
-    repo: row.repo,
+    // int8 comes back as a string from `pg`; 0009 enforces NOT NULL.
+    repositoryId: row.repository_id,
     prNumber: row.pr_number,
     headSha: row.head_sha,
     status: row.status,
@@ -151,8 +145,9 @@ export class PostgresCycleStore implements CycleStore {
         .where("bot_token_ciphertext", "=", expectedTokenCiphertext)
         .returning("tenant_id").executeTakeFirst();
       if (!workspace) return false;
+      // The 0009 cascade FK is a database backstop; the explicit delete keeps
+      // this transaction correct even against a database still at 0008.
       await trx.deleteFrom("channel_settings").where("team_id", "=", teamId).execute();
-      await trx.deleteFrom("team_channel_routes").where("team_id", "=", teamId).execute();
       await trx.updateTable("tenants").set({ enabled: false })
         .where("id", "=", workspace.tenant_id).execute();
       return true;
@@ -177,8 +172,6 @@ export class PostgresCycleStore implements CycleStore {
           cycle_key: input.cycleKey,
           tenant_id: input.tenantId,
           repository_id: input.repositoryId,
-          owner: input.owner,
-          repo: input.repo,
           pr_number: input.prNumber,
           pr_author: input.prAuthor,
           pr_title: input.prTitle,

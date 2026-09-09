@@ -10,8 +10,6 @@ import { Kysely, PostgresDialect, sql } from "kysely";
 import { Migrator } from "kysely/migration";
 import { Client, Pool } from "pg";
 import {
-  backfillMultitenancy,
-  prepareRollbackToA,
   provisionTenant,
   validateMultitenancy,
   type AdminProviders,
@@ -20,7 +18,6 @@ import { decryptSlackToken, encryptSlackToken } from "../src/slack-token-crypto"
 import { migrationProvider } from "../src/storage/migrations";
 import type { DB } from "../src/storage/schema";
 import { inspectSlackTokenEncryption } from "../src/storage/slack-token-check";
-import { GitHubRequestError } from "../src/github";
 
 const adminUrl =
   process.env.TEST_DATABASE_URL ?? "postgres://postgres:postgres@localhost:5432/postgres";
@@ -48,20 +45,24 @@ const providers: AdminProviders = {
     token === "xoxb-new"
       ? { teamId: "TNEW", botUserId: "UNEWBOT", channelIds: ["CNEW"] }
       : { teamId: "TADMIN", botUserId: "UADMINBOT", channelIds: ["CADMIN"] },
-  resolveRepository: async (owner, repo) => ({
-    installationId: "501",
-    githubAccountId: "601",
-    repositoryId: repo === "One" ? "101" : "102",
-    repositoryOwnerId: "601",
-    owner,
-    repo,
-    fullName: `${owner}/${repo}`,
-  }),
   inspectInstallationRepository: async (installationId, owner, repo) => ({
     installationId,
     githubAccountId: "602",
     repositoryId: "103",
     repositoryOwnerId: "602",
+    owner,
+    repo,
+    fullName: `${owner}/${repo}`,
+  }),
+};
+// TADMIN's GitHub pairing: installation 501, account 601, repository 101.
+const adminRepositoryProviders: AdminProviders = {
+  ...providers,
+  inspectInstallationRepository: async (installationId, owner, repo) => ({
+    installationId,
+    githubAccountId: "601",
+    repositoryId: "101",
+    repositoryOwnerId: "601",
     owner,
     repo,
     fullName: `${owner}/${repo}`,
@@ -104,11 +105,11 @@ try {
     timeout: 10_000,
   });
   const status = JSON.parse((await runAdmin(["migration-status"])).stdout);
-  assert.equal(status.migrations.at(-1).name, "0008_multitenant_expand");
+  assert.equal(status.migrations.at(-1).name, "0009_multitenant_enforce");
   assert.equal(status.migrations.at(-1).status, "executed");
   for (const missing of ["--expect-current", "--service-stopped", "--traffic-paused"]) {
     const flags = ["--confirm", "--service-stopped", "--traffic-paused"];
-    if (missing !== "--expect-current") flags.push("--expect-current", "0008_multitenant_expand");
+    if (missing !== "--expect-current") flags.push("--expect-current", "0009_multitenant_enforce");
     await assert.rejects(runAdmin(["migrate-to", "0007_mention_modes", ...flags.filter((flag) => flag !== missing)]), /Schema downgrade requires/);
     assert.equal(JSON.parse((await runAdmin(["migration-status"])).stdout).migrations.at(-1).status, "executed");
   }
@@ -118,7 +119,7 @@ try {
   await migrationBlocker.connect();
   try {
     await migrationBlocker.query("select pg_advisory_lock(hashtextextended('feature-rec-migrations', 0))");
-    const competing = Promise.allSettled([0, 1].map(() => runAdmin(["migrate-to", "0007_mention_modes", "--confirm", "--expect-current", "0008_multitenant_expand", "--service-stopped", "--traffic-paused"])));
+    const competing = Promise.allSettled([0, 1].map(() => runAdmin(["migrate-to", "0007_mention_modes", "--confirm", "--expect-current", "0009_multitenant_enforce", "--service-stopped", "--traffic-paused"])));
     try {
       await waitForBlockedQueries(2);
     } finally {
@@ -130,132 +131,32 @@ try {
   } finally {
     await migrationBlocker.end();
   }
-  await runAdmin(["migrate-to", "0008_multitenant_expand", "--confirm", "--expect-current", "0007_mention_modes"]);
-  assert.equal(JSON.parse((await runAdmin(["prepare-rollback-to-a", "--dry-run"])).stdout).ok, true);
+  await runAdmin(["migrate-to", "0009_multitenant_enforce", "--confirm", "--expect-current", "0007_mention_modes"]);
+  assert.equal(JSON.parse((await runAdmin(["migration-status"])).stdout).migrations.at(-1).name, "0009_multitenant_enforce");
   await assert.rejects(runAdmin(["validate-contract-readiness"]), /canonical base64/);
 
   assert.deepEqual(await inspectSlackTokenEncryption(db, null), { keyError: null, invalidWorkspaces: [] });
-  const emptyBackfill = { db, providers, slackBotToken: "xoxb-admin", encryptionKey: key, tenantId };
-  const emptyDryRun = await backfillMultitenancy({ ...emptyBackfill, apply: false });
-  assert.deepEqual((await backfillMultitenancy({ ...emptyBackfill, apply: true })).issues, emptyDryRun.issues);
-  assert.ok(emptyDryRun.issues.some((issue) => issue.includes("at least one GitHub repository")));
-  assert.equal(await db.selectFrom("slack_token_encryption_key").selectAll().executeTakeFirst(), undefined);
   for (const selectedChannelId of ["", " ", "CUNKNOWN"]) {
     await assert.rejects(provisionTenant({ db, providers, slackBotToken: "xoxb-new", encryptionKey: key, installationId: "502", repository: { owner: "Beta", repo: "Three" }, selectedChannelId }), /channel ID must not be empty|not a member/);
   }
+  // Rejected provisioning writes nothing, including the encryption-key verifier.
+  assert.equal(await db.selectFrom("slack_token_encryption_key").selectAll().executeTakeFirst(), undefined);
 
-  await sql`
-    insert into team_channel_routes (team_id, selected_channel_id)
-    values ('TADMIN', 'CADMIN');
-    insert into channel_settings
-      (team_id, channel_id, mention_mode, mention_audience, approvers, updated_by, updated_at)
-    values ('TADMIN', 'CADMIN', 'approvers', null, null, 'UADMIN', now());
-    insert into review_cycles
-      (id, cycle_key, owner, repo, pr_number, pr_author, pr_title, head_sha,
-       status, attempt_id, created_at, updated_at)
-    values
-      ('cycle-one', 'Acme/One#1:abcdefg', 'Acme', 'One', 1, 'a', 'one',
-       'abcdefg', 'failed', 'attempt-one', '2026-01-01', '2026-01-01'),
-      ('cycle-two', 'Acme/Two#2:hijklmn', 'Acme', 'Two', 2, 'b', 'two',
-       'hijklmn', 'accepted', 'attempt-two', '2026-01-01', '2026-01-01')
-  `.execute(db);
-
-  await sql`
-    insert into review_cycles
-      (id, cycle_key, owner, repo, pr_number, pr_author, pr_title, head_sha,
-       status, attempt_id, created_at, updated_at)
-    values
-      ('cycle-collision', 'legacy-collision#1:abcdefg', 'Acme', 'One', 1, 'c',
-       'collision', 'abcdefg', 'failed', 'attempt-collision', '2026-01-01', '2026-01-01')
-  `.execute(db);
-  const collision = await backfillMultitenancy({
+  const applied = await provisionTenant({
     db,
-    providers,
+    providers: adminRepositoryProviders,
     slackBotToken: "xoxb-admin",
     encryptionKey: key,
+    installationId: "501",
+    repository: { owner: "Acme", repo: "One" },
     tenantId,
-    apply: false,
+    selectedChannelId: "CADMIN",
   });
-  assert.ok(collision.issues.some((issue) => issue.includes("future cycle key collision")));
-  assert.equal(collision.applied, false);
-  await db.deleteFrom("review_cycles").where("id", "=", "cycle-collision").execute();
-
-  const splitInstallationProviders: AdminProviders = {
-    ...providers,
-    resolveRepository: async (owner, repo) => ({
-      ...(await providers.resolveRepository(owner, repo)),
-      installationId: repo === "Two" ? "999" : "501",
-      githubAccountId: repo === "Two" ? "888" : "601",
-    }),
-  };
-  const mappingConflict = await backfillMultitenancy({
-    db,
-    providers: splitInstallationProviders,
-    slackBotToken: "xoxb-admin",
-    encryptionKey: key,
-    tenantId,
-    apply: false,
-  });
-  assert.ok(
-    mappingConflict.issues.some((issue) => issue.includes("more than one GitHub installation/account")),
-  );
-  assert.equal(mappingConflict.repositoryMappings.length, 2);
-
-  const unresolvedProviders: AdminProviders = {
-    ...providers,
-    resolveRepository: async (owner, repo) => {
-      if (repo === "Two") throw new Error("not found");
-      return providers.resolveRepository(owner, repo);
-    },
-  };
-  const unresolved = await backfillMultitenancy({
-    db,
-    providers: unresolvedProviders,
-    slackBotToken: "xoxb-admin",
-    encryptionKey: key,
-    tenantId,
-    apply: false,
-  });
-  assert.deepEqual(unresolved.unresolvedRepositories, ["Acme/Two"]);
-  for (const failure of [new GitHubRequestError(503), new GitHubRequestError(404), new GitHubRequestError(null), new Error("secret-do-not-log")]) {
-    const report = await backfillMultitenancy({ db, providers: { ...providers, resolveRepository: async () => { throw failure; } }, slackBotToken: "xoxb-admin", encryptionKey: key, tenantId, apply: false });
-    assert.ok(report.issues.some((issue) => issue.includes(failure instanceof GitHubRequestError ? failure.message : "unexpected discovery failure")));
-    assert.ok(!JSON.stringify(report).includes("secret-do-not-log"));
-  }
-
-  const dryRun = await backfillMultitenancy({
-    db,
-    providers,
-    slackBotToken: "xoxb-admin",
-    encryptionKey: key,
-    tenantId,
-    apply: false,
-  });
-  assert.equal(dryRun.applied, false);
-  assert.deepEqual(dryRun.issues, []);
-  assert.equal(
-    await sql<{ count: string }>`select count(*)::text as count from tenants`
-      .execute(db)
-      .then((result) => result.rows[0]?.count),
-    "0",
-  );
-
-  const applied = await backfillMultitenancy({
-    db,
-    providers,
-    slackBotToken: "xoxb-admin",
-    encryptionKey: key,
-    tenantId,
-    apply: true,
-  });
-  assert.equal(applied.applied, true);
-  assert.equal(applied.validation?.ok, true);
+  assert.equal(applied.tenantId, tenantId);
+  assert.equal(applied.repositoryId, "101");
   assert.deepEqual(await inspectSlackTokenEncryption(db, key), { keyError: null, invalidWorkspaces: [] });
   assert.match((await inspectSlackTokenEncryption(db, Buffer.alloc(32, 10))).keyError!, /does not match/);
   assert.match((await inspectSlackTokenEncryption(db, null)).keyError!, /ENCRYPTION_KEY is required/);
-  const wrongKeyDryRun = await backfillMultitenancy({ ...emptyBackfill, encryptionKey: Buffer.alloc(32, 10), apply: false });
-  assert.ok(wrongKeyDryRun.issues.some((issue) => issue.includes("does not match")));
-  assert.deepEqual((await backfillMultitenancy({ ...emptyBackfill, encryptionKey: Buffer.alloc(32, 10), apply: true })).issues, wrongKeyDryRun.issues);
   const savedVerifier = await db.selectFrom("slack_token_encryption_key").selectAll().executeTakeFirstOrThrow();
   await db.deleteFrom("slack_token_encryption_key").execute();
   assert.match((await inspectSlackTokenEncryption(db, key)).keyError!, /verifier is missing/);
@@ -278,72 +179,36 @@ try {
     await db.selectFrom("tenants").select("enabled").where("id", "=", tenantId).executeTakeFirstOrThrow().then((row) => row.enabled),
     true,
   );
-  assert.deepEqual(
-    await db.selectFrom("review_cycles").select(["id", "tenant_id", "repository_id", "cycle_key"]).orderBy("id").execute(),
-    [
-      { id: "cycle-one", tenant_id: tenantId, repository_id: "101", cycle_key: "Acme/One#1:abcdefg" },
-      { id: "cycle-two", tenant_id: tenantId, repository_id: "102", cycle_key: "Acme/Two#2:hijklmn" },
-    ],
-  );
-
-  // Repeated apply is idempotent and the no-writer cutover mode switches all
-  // keys with the same canonical core builder used by the multitenant runtime.
-  assert.equal(
-    (
-      await backfillMultitenancy({
-        db,
-        providers,
-        slackBotToken: "xoxb-admin",
-        encryptionKey: key,
-        tenantId,
-        apply: true,
-        rebuildCycleKeys: true,
-        trafficPaused: true,
-      })
-    ).validation?.ok,
-    true,
-  );
-  assert.deepEqual(
-    await db.selectFrom("review_cycles").select(["id", "cycle_key"]).orderBy("id").execute(),
-    [
-      { id: "cycle-one", cycle_key: `${tenantId}/101#1:abcdefg` },
-      { id: "cycle-two", cycle_key: `${tenantId}/102#2:hijklmn` },
-    ],
-  );
+  // Cycles written by the deploy-C runtime carry canonical multitenant keys and
+  // no repository names; the contract-readiness validator accepts them.
+  await db.insertInto("review_cycles").values([
+    {
+      id: "cycle-one", cycle_key: `${tenantId}/101#1:abcdefg`, tenant_id: tenantId, repository_id: "101",
+      pr_number: 1, pr_author: "a", pr_title: "one", head_sha: "abcdefg",
+      status: "failed", attempt_id: "attempt-one", created_at: "2026-01-01", updated_at: "2026-01-01",
+    },
+    {
+      id: "cycle-two", cycle_key: `${tenantId}/102#2:hijklmn`, tenant_id: tenantId, repository_id: "102",
+      pr_number: 2, pr_author: "b", pr_title: "two", head_sha: "hijklmn",
+      status: "accepted", attempt_id: "attempt-two", created_at: "2026-01-01", updated_at: "2026-01-01",
+    },
+  ]).execute();
   assert.equal(
     (await validateMultitenancy({ db, encryptionKey: key, requireFutureCycleKeys: true })).ok,
     true,
   );
 
-  await assert.rejects(
-    prepareRollbackToA({ db, apply: true }),
-    /traffic-paused acknowledgement/,
-  );
-  const rollback = await prepareRollbackToA({ db, apply: true, trafficPaused: true });
-  assert.equal(rollback.ok, true);
-  assert.deepEqual(
-    await db.selectFrom("review_cycles").select(["id", "cycle_key"]).orderBy("id").execute(),
-    [
-      { id: "cycle-one", cycle_key: "Acme/One#1:abcdefg" },
-      { id: "cycle-two", cycle_key: "Acme/Two#2:hijklmn" },
-    ],
-  );
-
-  // No selected channel needs no legacy route; missing selected routes and
-  // orphaned or mismatched legacy routes must still prevent rollback.
-  await db.deleteFrom("team_channel_routes").where("team_id", "=", "TADMIN").execute();
-  await db.updateTable("slack_workspaces").set({ selected_channel_id: null }).where("team_id", "=", "TADMIN").execute();
-  assert.equal((await prepareRollbackToA({ db, apply: false })).ok, true);
-  assert.equal((await prepareRollbackToA({ db, apply: true, trafficPaused: true })).applied, true);
-  assert.equal(await db.selectFrom("team_channel_routes").selectAll().executeTakeFirst(), undefined);
-  await db.updateTable("slack_workspaces").set({ selected_channel_id: "CADMIN" }).where("team_id", "=", "TADMIN").execute();
-  assert.equal((await prepareRollbackToA({ db, apply: false })).ok, false);
-  await db.insertInto("team_channel_routes").values({ team_id: "TADMIN", selected_channel_id: "CWRONG" }).execute();
-  assert.equal((await prepareRollbackToA({ db, apply: false })).ok, false);
-  await db.updateTable("team_channel_routes").set({ team_id: "TORPHAN", selected_channel_id: "CADMIN" }).where("team_id", "=", "TADMIN").execute();
-  assert.equal((await prepareRollbackToA({ db, apply: false })).ok, false);
-  await db.updateTable("team_channel_routes").set({ team_id: "TADMIN" }).where("team_id", "=", "TORPHAN").execute();
-  assert.equal((await prepareRollbackToA({ db, apply: false })).ok, true);
+  // A colliding identity with a stray key is reported, never silently resolved.
+  await db.insertInto("review_cycles").values({
+    id: "cycle-collision", cycle_key: "legacy-collision#1:abcdefg", tenant_id: tenantId, repository_id: "101",
+    pr_number: 1, pr_author: "c", pr_title: "collision", head_sha: "abcdefg",
+    status: "failed", attempt_id: "attempt-collision", created_at: "2026-01-01", updated_at: "2026-01-01",
+  }).execute();
+  const collision = await validateMultitenancy({ db, encryptionKey: key, requireFutureCycleKeys: true });
+  assert.equal(collision.ok, false);
+  assert.ok(collision.issues.some((issue) => issue.includes("future cycle key collision")));
+  assert.ok(collision.issues.some((issue) => issue.includes("has not been switched to its multitenant cycle key")));
+  await db.deleteFrom("review_cycles").where("id", "=", "cycle-collision").execute();
 
   const wrongAad = encryptSlackToken({ token: "xoxb-admin", teamId: "TOTHER", key });
   await db
@@ -398,51 +263,39 @@ try {
   } finally {
     clearTimeout(timeout);
   }
-  await backfillMultitenancy({
-    db,
-    providers,
-    slackBotToken: "xoxb-admin",
-    encryptionKey: key,
-    tenantId,
-    apply: true,
-  });
+  // Restore TADMIN's valid ciphertext after the wrong-AAD scenario.
+  await db.updateTable("slack_workspaces").set({ bot_token_ciphertext: workspace.bot_token_ciphertext }).where("team_id", "=", "TADMIN").execute();
 
   const channelWriter = new Client({ connectionString: testUrl });
   await channelWriter.connect();
   try {
-    for (const operation of ["provision", "backfill"] as const) {
-      await channelWriter.query("BEGIN");
-      await channelWriter.query("select pg_advisory_xact_lock(hashtextextended('team-route:TADMIN', 0))");
-      await channelWriter.query("select team_id from slack_workspaces where team_id = 'TADMIN' for update");
-      const pending = Promise.allSettled([
-        operation === "provision"
-          ? provisionTenant({
-              db,
-              providers: { ...providers, inspectInstallationRepository: async (_id, owner, repo) => providers.resolveRepository(owner, repo) },
-              slackBotToken: "xoxb-admin",
-              encryptionKey: key,
-              installationId: "501",
-              repository: { owner: "Acme", repo: "One" },
-              tenantId,
-            })
-          : backfillMultitenancy({ db, providers, slackBotToken: "xoxb-admin", encryptionKey: key, tenantId, apply: true }),
-      ]);
-      const selectedChannelId = `C-${operation}`;
-      try {
-        // The operator is now blocked behind an in-flight channel selection.
-        // Without the channel lock it would already have read the old value.
-        await waitForBlockedQueries(1);
-        await channelWriter.query("update team_channel_routes set selected_channel_id = $1 where team_id = 'TADMIN'", [selectedChannelId]);
-        await channelWriter.query("update slack_workspaces set selected_channel_id = $1 where team_id = 'TADMIN'", [selectedChannelId]);
-        await channelWriter.query("COMMIT");
-      } finally {
-        await channelWriter.query("ROLLBACK");
-      }
-      const [outcome] = await pending;
-      if (outcome.status === "rejected") throw outcome.reason;
-      assert.equal((await db.selectFrom("slack_workspaces").select("selected_channel_id").where("team_id", "=", "TADMIN").executeTakeFirstOrThrow()).selected_channel_id, selectedChannelId);
-      assert.equal((await db.selectFrom("team_channel_routes").select("selected_channel_id").where("team_id", "=", "TADMIN").executeTakeFirstOrThrow()).selected_channel_id, selectedChannelId);
+    await channelWriter.query("BEGIN");
+    await channelWriter.query("select pg_advisory_xact_lock(hashtextextended('team-route:TADMIN', 0))");
+    await channelWriter.query("select team_id from slack_workspaces where team_id = 'TADMIN' for update");
+    const pending = Promise.allSettled([
+      provisionTenant({
+        db,
+        providers: adminRepositoryProviders,
+        slackBotToken: "xoxb-admin",
+        encryptionKey: key,
+        installationId: "501",
+        repository: { owner: "Acme", repo: "One" },
+        tenantId,
+      }),
+    ]);
+    const selectedChannelId = "C-provision";
+    try {
+      // The operator is now blocked behind an in-flight channel selection.
+      // Without the channel lock it would already have read the old value.
+      await waitForBlockedQueries(1);
+      await channelWriter.query("update slack_workspaces set selected_channel_id = $1 where team_id = 'TADMIN'", [selectedChannelId]);
+      await channelWriter.query("COMMIT");
+    } finally {
+      await channelWriter.query("ROLLBACK");
     }
+    const [outcome] = await pending;
+    if (outcome.status === "rejected") throw outcome.reason;
+    assert.equal((await db.selectFrom("slack_workspaces").select("selected_channel_id").where("team_id", "=", "TADMIN").executeTakeFirstOrThrow()).selected_channel_id, selectedChannelId);
   } finally {
     await channelWriter.end();
   }
@@ -464,7 +317,7 @@ try {
   assert.deepEqual(await inspectSlackTokenEncryption(db, key), { keyError: null, invalidWorkspaces: [{ tenantId, teamId: "TADMIN" }] });
   await db.updateTable("slack_workspaces").set({ bot_token_ciphertext: workspace.bot_token_ciphertext }).where("team_id", "=", "TADMIN").execute();
   assert.equal(
-    await db.selectFrom("team_channel_routes").select("selected_channel_id").where("team_id", "=", "TNEW").executeTakeFirstOrThrow().then((row) => row.selected_channel_id),
+    await db.selectFrom("slack_workspaces").select("selected_channel_id").where("team_id", "=", "TNEW").executeTakeFirstOrThrow().then((row) => row.selected_channel_id),
     "CNEW",
   );
 
@@ -508,6 +361,29 @@ try {
       tenantId: "f4a35af1-843d-4276-af6e-25f3929f16b3",
     }),
     /re-pair existing integrations|different tenants/,
+  );
+
+  // Replace-pairing must not wipe the retained team's channel settings: the
+  // same-team workspace row is re-paired in place, so the 0009 cascade never fires.
+  await db.insertInto("channel_settings").values({
+    team_id: "TNEW", channel_id: "CNEW", mention_mode: "approvers",
+    mention_audience: null, approvers: '["UNEW"]', updated_by: "UNEW", updated_at: new Date().toISOString(),
+  }).execute();
+  const repaired = await provisionTenant({
+    db,
+    providers,
+    slackBotToken: "xoxb-new",
+    encryptionKey: key,
+    installationId: "504",
+    repository: { owner: "Other", repo: "Repo" },
+    tenantId: secondTenantId,
+    selectedChannelId: "CNEW",
+    replacePairing: true,
+  });
+  assert.equal(repaired.githubInstallationId, "504");
+  assert.equal(
+    (await db.selectFrom("channel_settings").select("approvers").where("team_id", "=", "TNEW").executeTakeFirstOrThrow()).approvers,
+    '["UNEW"]',
   );
 
   const provisioningBlocker = new Client({ connectionString: testUrl });

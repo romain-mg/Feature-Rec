@@ -204,7 +204,8 @@ channel is unavailable when a validation is ready, no Slack message is posted an
 fails with instructions to re-invite the bot or select another channel.
 
 `slack_workspaces.selected_channel_id` is the persistent routing source of truth, with one selected
-channel per tenant workspace. Deploy B also writes `team_channel_routes` during the rollback window.
+channel per tenant workspace. Deploy C stopped the deploy-B dual write to `team_channel_routes`; the
+legacy table physically remains, unread and unwritten, until the deploy-D contract drops it.
 `channel_settings` is the source of truth for each channel's mention mode, custom mention
 audience, and approver policy. A never-configured channel uses virtual defaults (follow approvers,
 unrestricted approval) without inserting a settings row. Bot membership is read live from Slack for
@@ -379,24 +380,33 @@ name columns. Deploys A and B register only through `0008` and retain `team_chan
 Deploy B reads the workspace selection and dual-writes the legacy route. Its `down()` refuses to proceed
 if any cycle lacks the legacy `owner`/`repo` values needed by deploy A.
 
+Deploy C registers `0009_multitenant_enforce`. It refuses to run while any review cycle has a null
+`tenant_id`/`repository_id` or any `channel_settings` row references an absent Slack workspace, then
+sets both cycle columns `NOT NULL` and adds the named `channel_settings_team_id_fkey` foreign key
+with `ON DELETE CASCADE`. Its `down()` drops that constraint and both `NOT NULL`s without touching
+data, so C-to-B stays reversible. Deploy C also stops every legacy read/write: no `owner`/`repo`
+values are written to new cycles and no code path touches `team_channel_routes`. Because C-written
+cycles have null repository names, `0008`'s `down()` (and therefore deploy A) becomes unreachable
+once C has served traffic, except by restoring the pre-cutover backup.
+
 The image includes the compiled `node dist/admin.js` control plane; it does not depend on `tsx` or
 development dependencies. Production commands require an explicit `--environment` label, and every
 write requires `--confirm`. Run them inside Railway's private network:
 
 ```bash
 railway ssh -- node dist/admin.js migration-status --environment production
-railway ssh -- node dist/admin.js backfill-multitenancy --environment production --dry-run
-railway ssh -- node dist/admin.js backfill-multitenancy --environment production --apply --confirm
 railway ssh -- node dist/admin.js validate-contract-readiness --environment production
 ```
 
-Generate `FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY` once with `openssl rand -base64 32`, seal it in
-the hosted environment, and keep it stable. Backfill validates the legacy Slack team, resolves every
-legacy repository through the GitHub App, detects future cycle-key collisions, writes one disabled
-tenant transactionally, and enables it only after validation. Run this reconciliation with the
-retained deploy-A artifact before cutover; additional tenants are supported after deploy B is serving.
+The one-time singleton backfill (`backfill-multitenancy`) and the deploy-A rollback preparation
+(`prepare-rollback-to-a`) were completed before the deploy-B cutover and exist only in the retained
+A/B artifacts; the deploy-C artifact removes them. Contract-readiness validation no longer compares
+legacy and workspace selected-channel values because deploy C stopped the dual write.
 
-The first successful backfill/provisioning transaction stores an independent HMAC-SHA256 key verifier
+Generate `FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY` once with `openssl rand -base64 32`, seal it in
+the hosted environment, and keep it stable.
+
+The first successful provisioning transaction stores an independent HMAC-SHA256 key verifier
 in the singleton `slack_token_encryption_key` table; subsequent writes and startup must match it.
 Startup decrypt-checks stored tokens after checking that verifier. A wrong/missing key or missing
 verifier prevents startup; one corrupt token produces an error with the tenant/workspace IDs and
@@ -405,9 +415,8 @@ repair/re-provision the affected credentials; readiness validation continues to 
 Neither tokens nor ciphertexts are logged. Back up the verifier with the database and the key
 separately. Never delete the verifier to bypass a key mismatch; restore the matching backup/key.
 
-For the final pre-cutover reconciliation, pause new workflows and drain active runs, then use
-`backfill-multitenancy --apply --confirm --rebuild-cycle-keys --traffic-paused`. To roll the database
-back to the pre-expansion schema:
+To roll the database back one deploy wave, always migrate down with the **newer** artifact before
+starting the older image:
 
 1. Pause runner and Slack writes, drain active requests, and verify a fresh database backup and the
    retained older release. Disable automatic deploys and stop all current service instances using
@@ -415,26 +424,36 @@ back to the pre-expansion schema:
 2. From a **separate maintenance process**, run the retained newer admin artifact against the private
    database (for example via a private `railway connect postgres --tunnel-only` connection). Do not
    use `railway ssh` inside the still-running service for a schema downgrade. Check migration status.
-3. Run `node dist/admin.js migrate-to 0007_mention_modes --environment production --expect-current
-   0008_multitenant_expand --service-stopped --traffic-paused --confirm`. These flags acknowledge
-   actual operator actions; they do not stop Railway for you. The expected-current check and migration
-   are serialized with startup migrations, but a later service restart would reapply `0008`.
+3. For C-to-B, run `node dist/admin.js migrate-to 0008_multitenant_expand --environment production
+   --expect-current 0009_multitenant_enforce --service-stopped --traffic-paused --confirm` with the
+   deploy-C admin artifact; `0009`'s `down()` drops the channel-settings foreign key and both
+   review-cycle `NOT NULL`s. For the further step to the pre-expansion schema, run `migrate-to
+   0007_mention_modes --expect-current 0008_multitenant_expand` with the same discipline. These
+   flags acknowledge actual operator actions; they do not stop Railway for you. The expected-current
+   check and migration are serialized with startup migrations, but a later service restart would
+   reapply that artifact's latest migration (`0009` for a C instance). Deploy C stops maintaining
+   `team_channel_routes`, so before starting the B image reconcile the frozen table against
+   `slack_workspaces` (delete rows for uninstalled teams, update diverged selections) — artifact B
+   reads it as a provisioning fallback and resumes dual-writing it.
 4. Verify migration status, start only the pinned older image, check `/health` and an existing review
    flow, then resume traffic. Restore autodeploys only once their target is safe for the chosen schema.
 
 Do not expose PostgreSQL publicly or hand-edit Kysely's migration records. Downgrading `0008` removes
 tenant integrations and the key verifier; retain the backup for recovery.
 
-B-to-A requires no migration down, but is allowed only for a validated singleton: pause writes,
-run `prepare-rollback-to-a --dry-run`, then `--apply --confirm --traffic-paused` with the explicit
-environment, and redeploy the retained A image only after its report passes. Keep the old hosted
-runner/Slack secrets sealed and unused during this observation window. Once a second tenant exists,
-use a B hotfix or restore the pre-cutover backup instead. Deploy C and D are separate future PRs;
-C-to-B must migrate down to `0008` using C's admin artifact before starting B, and D-to-C must migrate
-down to `0009` using D's artifact before starting C. Kysely rejects migrations absent from the older
-artifact, so reversing those steps prevents startup.
+B-to-A required no migration down and was allowed only for a validated singleton via the retained
+B artifact's `prepare-rollback-to-a` command; the deploy-C artifact removes that command, and any
+cycle written by deploy C lacks the legacy repository names deploy A needs. After C has served
+traffic, recovering to A means restoring the pre-cutover backup. Deploy D remains a separate future
+PR; C-to-B must migrate down to `0008` using C's admin artifact before starting B, and D-to-C must
+migrate down to `0009` using D's artifact before starting C. Kysely rejects migrations absent from
+the older artifact, so reversing those steps prevents startup.
 
 ### OIDC cutover checklist
+
+This checklist governed the completed deploy-B cutover; it is retained as the record of that
+procedure. The backfill and route-comparison steps require the retained A/B artifacts — the deploy-C
+artifact no longer carries them.
 
 For an existing singleton installation, retain the A artifact and verify a current backup/restore
 drill before merging the cutover release. Inventory every consuming repository, recording:
@@ -450,7 +469,8 @@ the retained A backfill with `--rebuild-cycle-keys --traffic-paused`. Require a 
 request handling. Switch the inventoried workflows to their pinned OIDC revision, provision the
 second test tenant, run the two-tenant smoke below, and resume traffic. During observation, compare
 legacy/new selected-channel values, rerun readiness validation, and inspect tenant-scoped decrypt,
-OIDC/JWKS, and installation-authorization failures. Keep migrations `0009` and `0010` out of B.
+OIDC/JWKS, and installation-authorization failures. Keep migrations `0009` and `0010` out of B;
+`0009_multitenant_enforce` ships in deploy C, after this cutover's observation window is clean.
 
 ### Provision a tenant
 

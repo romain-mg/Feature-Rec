@@ -26,8 +26,6 @@ function start(overrides: Partial<StartCycleInput> = {}): StartCycleInput {
   const input = {
     tenantId: tenantA,
     repositoryId,
-    owner: "Original",
-    repo: "Name",
     prNumber: 1,
     headSha: "first-head",
     prAuthor: "author",
@@ -38,8 +36,21 @@ function start(overrides: Partial<StartCycleInput> = {}): StartCycleInput {
 }
 
 try {
-  assert.equal(Object.keys(await migrationProvider.getMigrations()).sort().at(-1), "0008_multitenant_expand");
+  assert.equal(Object.keys(await migrationProvider.getMigrations()).sort().at(-1), "0009_multitenant_enforce");
   await store.init();
+
+  // 0009 enforcement holds at the database level: cycles without authenticated
+  // identity and channel settings without an installed workspace are rejected.
+  await assert.rejects(
+    sql`insert into review_cycles (id, cycle_key, tenant_id, repository_id, pr_number, pr_author, pr_title, head_sha, status, attempt_id, created_at, updated_at)
+        values ('null-identity', 'null/key#1:abcdefg', null, null, 1, 'author', 'title', 'abcdefg', 'analyzing', 'attempt', now(), now())`.execute(db),
+    /null value|not-null/,
+  );
+  await assert.rejects(
+    sql`insert into channel_settings (team_id, channel_id, mention_mode, mention_audience, approvers, updated_by, updated_at)
+        values ('TORPHAN', 'CORPHAN', 'approvers', null, null, 'UA', now())`.execute(db),
+    /channel_settings_team_id_fkey/,
+  );
   await db.insertInto("tenants").values([{ id: tenantA, enabled: true }, { id: tenantB, enabled: true }]).execute();
   await db.insertInto("github_installations").values([
     { tenant_id: tenantA, installation_id: "9007199254740995", github_account_id: "9007199254740997" },
@@ -65,19 +76,20 @@ try {
   const active = first.created ? first : duplicate;
   assert.equal(active.cycle.repositoryId, repositoryId);
   assert.equal(active.cycle.cycleKey, `${tenantA}/${repositoryId}#1:first-head`);
+  // C-written rows never carry legacy repository names, even at the SQL level.
+  const legacyNames = await sql<{ owner: string | null; repo: string | null }>`
+    select owner, repo from review_cycles where id = ${active.cycle.id}`.execute(db);
+  assert.deepEqual(legacyNames.rows[0], { owner: null, repo: null });
 
   const otherTenant = await store.startCycle(start({ tenantId: tenantB }));
   const otherRepository = await store.startCycle(start({ repositoryId: "42" }));
   assert.equal((await store.getCycle(active.cycle.id))?.status, "analyzing");
 
-  // Same authenticated identity after rename is a duplicate; display names never
-  // partition locks or supersession. Other repositories and tenants survive.
-  const renamedDuplicate = await store.startCycle(start({ owner: "Renamed", repo: "Moved" }));
-  assert.equal(renamedDuplicate.created, false);
-  assert.equal(renamedDuplicate.cycle.id, active.cycle.id);
+  // Concurrent newer heads race under one per-PR lock; exactly one survives and
+  // the original is superseded. Other repositories and tenants are untouched.
   const [renamedA, renamedB] = await Promise.all([
-    store.startCycle(start({ owner: "Renamed", headSha: "second-head" })),
-    store.startCycle(start({ owner: "Another", headSha: "third-head" })),
+    store.startCycle(start({ headSha: "second-head" })),
+    store.startCycle(start({ headSha: "third-head" })),
   ]);
   const statuses = await Promise.all([renamedA, renamedB].map(async (result) => (await store.getCycle(result.cycle.id))!.status));
   assert.deepEqual(statuses.sort(), ["analyzing", "superseded"]);
@@ -111,16 +123,12 @@ try {
   assert.equal(await store.transitionSlackStatus({ cycleId: takeover.cycle.id, tenantId: tenantB, from: ["analyzing"], to: "accepted" }), null);
   assert.equal((await store.transitionSlackStatus({ cycleId: takeover.cycle.id, tenantId: tenantA, from: ["analyzing"], to: "accepted" }))?.status, "accepted");
 
-  // C-written rows remain readable during a C-to-B rollback: compatibility
-  // names may be null even though authenticated identity must be present.
-  await db.updateTable("review_cycles").set({ owner: null, repo: null }).where("id", "=", newer.cycle.id).execute();
-  assert.equal((await store.getCycle(newer.cycle.id))?.owner, null);
   assert.equal((await store.getCycleByKey(newer.cycle.cycleKey))?.repositoryId, "42");
 
-  // Legacy routes never supply runtime routing authority after cutover.
-  await db.insertInto("team_channel_routes").values([
-    { team_id: "TA", selected_channel_id: "CLEGACY" }, { team_id: "UNKNOWN", selected_channel_id: "CUNSAFE" },
-  ]).execute();
+  // Legacy routes never supply runtime routing authority after cutover. Raw SQL:
+  // the physical table survives until the 0010 contract but has no schema type.
+  await sql`insert into team_channel_routes (team_id, selected_channel_id)
+    values ('TA', 'CLEGACY'), ('UNKNOWN', 'CUNSAFE')`.execute(db);
   assert.equal(await store.getSelectedChannelId("TA"), null);
   assert.equal(await store.getSelectedChannelId("UNKNOWN"), null);
   await assert.rejects(store.selectTeamChannel({ teamId: "UNKNOWN", channelId: "CNEW" }), /no longer installed/);
@@ -128,7 +136,10 @@ try {
   assert.equal(initialized.filter((result) => result.initializedRoute).length, 1);
   await Promise.all(["CA3", "CA4"].map((channelId) => store.selectTeamChannel({ teamId: "TA", channelId })));
   const channelA = (await store.getSelectedChannelId("TA"))!;
-  assert.equal((await db.selectFrom("team_channel_routes").select("selected_channel_id").where("team_id", "=", "TA").executeTakeFirstOrThrow()).selected_channel_id, channelA);
+  // Selection changes stop propagating to the legacy table entirely.
+  const legacyRoute = await sql<{ selected_channel_id: string }>`
+    select selected_channel_id from team_channel_routes where team_id = 'TA'`.execute(db);
+  assert.equal(legacyRoute.rows[0]?.selected_channel_id, "CLEGACY");
   assert.equal(await store.setSelectedChannelApprovers({ teamId: "TA", expectedChannelId: "CSTALE", approvers: ["UWRONG"], updatedBy: "UA" }), false);
   assert.equal(await store.setSelectedChannelApprovers({ teamId: "TA", expectedChannelId: channelA, approvers: ["UA"], updatedBy: "UA" }), true);
   await store.selectTeamChannel({ teamId: "TB", channelId: "CB" });
@@ -142,7 +153,8 @@ try {
   assert.equal(await store.getSelectedChannelId("TA"), channelA);
 
   // Inject a database failure after deletion to prove tenant disable and all
-  // integration/settings deletes roll back as one transaction, before the FK.
+  // integration/settings deletes roll back as one transaction, with the 0009
+  // cascade FK as a backstop rather than the mechanism.
   await sql`
     create function reject_tenant_disable() returns trigger language plpgsql as $$
     begin raise exception 'test disable failure'; end $$;
@@ -168,7 +180,6 @@ try {
   assert.equal(await store.setSelectedChannelApprovers({ teamId: "TA", expectedChannelId: channelA, approvers: ["UA"], updatedBy: "UA" }), false);
   await assert.rejects(store.initializeTeamChannelRoute({ teamId: "TA", channelId: "CLATE" }), /no longer installed/);
   assert.equal((await db.selectFrom("channel_settings").selectAll().where("team_id", "=", "TA").execute()).length, 0);
-  assert.equal((await db.selectFrom("team_channel_routes").selectAll().where("team_id", "=", "TA").execute()).length, 0);
   assert.equal((await store.getSlackWorkspaceByTeamId("TB"))?.enabled, true);
   assert.equal((await store.getChannelSettings("TB", "CB")).mention.mode, "off");
   assert.ok(await store.getGitHubInstallationByTenantId(tenantA));

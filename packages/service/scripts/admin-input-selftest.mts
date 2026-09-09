@@ -10,7 +10,7 @@ for (const [command, option] of [["migrate-to", "expect-current"], ["provision-t
   assert.throws(() => parseArgs([command, `--${option}=first`, `--${option}=second`]), /only be supplied once/);
 }
 assert.throws(() => parseArgs(["provision-tenant", "--confrim"]), /Unknown option/);
-assert.throws(() => parseArgs(["migration-status", "--apply"]), /not supported/);
+assert.throws(() => parseArgs(["migration-status", "--replace-pairing"]), /not supported/);
 assert.throws(() => parseArgs(["provision-tenant", "--confirm=false"]), /does not take an argument/);
 assert.throws(() => parseArgs(["provision-tenant", "--confirm", "unexpected"]), /Unexpected positional/);
 const parsed = parseArgs(["migrate-to", "--confirm", "0007_mention_modes", "--expect-current=0008_multitenant_expand"]);

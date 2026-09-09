@@ -57,8 +57,6 @@ export const ReviewCycleSchema = z.object({
   cycleKey: z.string(),
   tenantId: z.string().uuid(),
   repositoryId: z.string().regex(/^[0-9]+$/),
-  owner: z.string().nullable(),
-  repo: z.string().nullable(),
   prNumber: z.number().int().positive(),
   headSha: z.string(),
   status: ReviewCycleStatusSchema,
@@ -77,19 +75,6 @@ export function buildCycleKey(input: {
   headSha: string;
 }): string {
   return `${input.tenantId}/${input.repositoryId}#${input.prNumber}:${input.headSha}`;
-}
-
-// Backfill and runtime share the same canonical identity implementation.
-export const buildTenantCycleKey = buildCycleKey;
-
-// Only the qualified deploy-A rollback command may rebuild legacy identities.
-export function buildLegacyCycleKey(input: {
-  owner: string;
-  repo: string;
-  prNumber: number;
-  headSha: string;
-}): string {
-  return `${input.owner}/${input.repo}#${input.prNumber}:${input.headSha}`;
 }
 
 export function normalizeOidcAudience(

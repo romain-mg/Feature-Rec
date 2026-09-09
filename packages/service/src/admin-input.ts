@@ -2,14 +2,12 @@ import { parseArgs as parseNodeArgs } from "node:util";
 import type { ReadStream, WriteStream } from "node:tty";
 
 const STRING_FLAGS = ["environment", "expect-current", "tenant-id", "selected-channel-id", "installation-id", "repository"];
-const BOOLEAN_FLAGS = ["help", "confirm", "require-future-cycle-keys", "dry-run", "apply", "rebuild-cycle-keys", "traffic-paused", "service-stopped", "replace-pairing"];
+const BOOLEAN_FLAGS = ["help", "confirm", "require-future-cycle-keys", "traffic-paused", "service-stopped", "replace-pairing"];
 const COMMAND_FLAGS: Record<string, string[]> = {
   "migration-status": [],
   "migrate-to": ["confirm", "expect-current", "traffic-paused", "service-stopped"],
   "validate-contract-readiness": ["require-future-cycle-keys"],
-  "backfill-multitenancy": ["dry-run", "apply", "confirm", "tenant-id", "rebuild-cycle-keys", "traffic-paused"],
   "provision-tenant": ["confirm", "installation-id", "repository", "tenant-id", "selected-channel-id", "replace-pairing"],
-  "prepare-rollback-to-a": ["dry-run", "apply", "confirm", "traffic-paused"],
   help: [],
 };
 

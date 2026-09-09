@@ -13,9 +13,4 @@ export async function writeSelectedChannel(trx: Transaction<DB>, teamId: string,
   const workspace = await trx.updateTable("slack_workspaces").set({ selected_channel_id: channelId })
     .where("team_id", "=", teamId).returning("team_id").executeTakeFirst();
   if (!workspace) throw new SlackWorkspaceUnavailableError();
-  // Deploy B keeps the legacy write so a qualified A rollback preserves routing.
-  await trx.insertInto("team_channel_routes")
-    .values({ team_id: teamId, selected_channel_id: channelId })
-    .onConflict((oc) => oc.column("team_id").doUpdateSet({ selected_channel_id: channelId }))
-    .execute();
 }
