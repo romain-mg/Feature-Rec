@@ -55,6 +55,7 @@ const env: ServiceEnv = {
   databaseUrl: testUrl,
   githubAppId: "",
   githubPrivateKey: "",
+  slackOAuth: null,
   slackSigningSecret: "slack-secret",
   slackTokenEncryptionKey: Buffer.alloc(32, 7),
   githubOidcIssuer: "https://token.actions.githubusercontent.com",

@@ -316,6 +316,7 @@ The runtime contract is:
 | `GITHUB_APP_ID` | Required for GitHub operations | GitHub App identifier |
 | `GITHUB_PRIVATE_KEY` | Required for GitHub operations | GitHub App signing key |
 | `SLACK_SIGNING_SECRET` | Required for Slack review | Slack interaction, event, and command verification |
+| `SLACK_APP_ID`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET` | Optional as a complete group | Hosted Slack OAuth configuration; distinct from the signing secret |
 | `FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY` | Required when workspace rows exist | Exactly 32 random bytes encoded as base64; encrypts each workspace's stored bot token |
 | `GITHUB_OIDC_ISSUER` | Optional | Trusted HTTPS issuer; defaults to `https://token.actions.githubusercontent.com` |
 
@@ -329,6 +330,33 @@ Credentials, query strings, and fragments are rejected. The audience is the norm
 with no independent audience override. Discovery/JWKS access is lazy until the first OIDC request,
 so a fresh-database `/health` smoke does not call GitHub or Slack. No runtime path accepts
 `FEATURE_REC_RUNNER_TOKEN`, `SLACK_BOT_TOKEN`, `FEATURE_REC_GITHUB_TOKEN`, or a `GITHUB_TOKEN` fallback.
+
+### Slack OAuth preparation (B2 milestone 1)
+
+The service validates optional OAuth configuration and includes an `@slack/oauth`
+installer factory. Public installation routes and persistent pending installations
+are implemented in later B2 milestones; configuring credentials alone does not
+make installation available. Existing Slack reviews and manual tenant provisioning
+continue to work.
+
+Leave all three OAuth variables absent or empty to disable configuration. Otherwise,
+provide all three: an app ID beginning with `A`, the numeric `SLACK_CLIENT_ID` pair
+separated by a dot, and a nonempty client secret without whitespace. Partial or
+malformed configuration fails startup with a diagnostic that omits supplied values.
+Startup and `/health` make no Slack request, including when OAuth is configured.
+
+Register the normalized `FEATURE_REC_BASE_URL` plus `/api/slack/oauth/callback` in
+the Slack app's OAuth redirect URLs; there is no independent redirect override.
+Use HTTPS for the hosted backend, enable unlisted distribution for additional
+workspaces, keep token rotation disabled, and retain the existing stable token
+encryption key for pending-token storage in the next milestones.
+
+The prepared installer uses OAuth v2, direct redirects, state and browser-cookie
+verification, and requires explicit state/installation stores. It has a ten-second
+network timeout and disables both ordinary and rate-limit retries. Its logger
+discards raw SDK arguments and emits only fixed warning/error categories. HTTP query
+redaction, cookie integration, and sanitized callback responses arrive with the
+routes; the factory must not be exposed without those protections.
 
 ## Railway Deployment
 

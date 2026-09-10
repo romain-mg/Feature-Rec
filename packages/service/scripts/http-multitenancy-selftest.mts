@@ -25,6 +25,7 @@ const encryptionKey = Buffer.alloc(32, 17);
 const env: ServiceEnv = {
   port: 0, baseUrl: "https://service.example", databaseUrl: dbUrl.toString(),
   githubAppId: "", githubPrivateKey: "", githubOidcIssuer: "https://token.actions.githubusercontent.com",
+  slackOAuth: null,
   slackTokenEncryptionKey: encryptionKey, slackSigningSecret: "signed-workspace-secret",
 };
 const tenants = { A: crypto.randomUUID(), B: crypto.randomUUID(), D: crypto.randomUUID() };

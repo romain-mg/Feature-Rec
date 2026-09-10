@@ -7,6 +7,7 @@ const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 }
 const client = new GitHubClient({
   port: 0, baseUrl: "https://feature-rec.example", databaseUrl: "unused",
   githubAppId: "123", githubPrivateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+  slackOAuth: null,
   slackSigningSecret: "", slackTokenEncryptionKey: null,
   githubOidcIssuer: "https://token.actions.githubusercontent.com",
 });

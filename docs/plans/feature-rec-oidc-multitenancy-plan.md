@@ -1,17 +1,43 @@
 # Feature-Rec OIDC and Multitenancy Dev Plan
 
-Status: PR A expand/prepare and PR B runtime implementation complete; production cutover and PR C/D migrations pending
+Status: PR A/B complete and deployed; PR B2 milestone 1 SDK/configuration implemented, hosted installation pending; PR C implemented but release gated on B2 and two-workspace validation; PR D contract pending
 
 Date: 2026-09-03
 
 Last reviewed: 2026-09-04
 
+Sequencing amended: 2026-09-08 — add PR B2 before releasing PR C; use
+OAuth endpoints on the existing backend, superseding the local-helper proposal.
+
+Installation entry simplified: 2026-09-09 — expose one fixed public OAuth start
+URL per deployment; retain protected sessions and operator-controlled activation.
+
 PR B implemented: 2026-09-05. The action and service use OIDC and tenant/repository
 identity, with workspace-bound Slack clients and compatibility writes retained.
-No migration after `0008_multitenant_expand` is registered. Local verification
+The PR B artifact registers no migration after `0008_multitenant_expand`. Local verification
 passed typecheck, lint, the full selftest suite, the production image build, and
 compiled-admin/health smoke tests against isolated PostgreSQL. Production
 backfill/cutover and the real two-tenant smoke remain operator release steps.
+
+PR C implemented: 2026-09-08, preserved in commit `cb34cc8` on
+`feat/oidc-multitenancy-pr-c`. Its current migration
+`0009_multitenant_enforce` must be renamed to `0010_multitenant_enforce` when
+integrating B2, which now owns additive migration `0009`. That source rename is
+not part of this plan-only amendment. The existing enforcement migration refuses null
+cycle identity and orphan channel settings, sets both review-cycle identity
+columns `NOT NULL`, and adds the named `channel_settings_team_id_fkey` cascade;
+its `down()` reverses only those constraints. The release stops every legacy
+read/write: `startCycle` no longer persists `owner`/`repo`, the selected-channel
+dual write and the lifecycle `team_channel_routes` delete are removed, and
+`owner`/`repo` left `ReviewCycleSchema` and the Kysely table types. Because
+backfill and A-rollback are provably inapplicable once enforcement runs, the deploy-C
+artifact also removes `backfill-multitenancy`, `prepare-rollback-to-a`,
+`buildLegacyCycleKey`, the validator's route-drift check, and the backfill-only
+`AdminProviders.resolveRepository` seam; those tools live on in the retained A/B
+artifacts. Physical legacy columns and `team_channel_routes` stay untouched for
+the PR D contract. Deploying C and the second observation window remain operator
+release steps. PR C development may continue in parallel, but its merge/deploy
+must wait for PR B2 and the first observation/readiness gate below.
 
 Scope: `packages/core`, `packages/action`, `packages/service`, migrations,
 operator tooling, CI, and product documentation
@@ -39,8 +65,10 @@ verified repository_id + tenant_id
 -> current GitHub full_name for API coordinates
 ```
 
-This plan uses expand/backfill/cutover/stop-legacy/contract. Because merging a PR
-autodeploys its artifact, each of the four deployment waves is a separate PR.
+This plan uses expand/backfill/cutover/hosted-installation/stop-legacy/contract.
+Because merging a PR autodeploys its artifact, release in order A, B, B2, C, D.
+B2 adds hosted installation handling and its own additive session table; it must
+not ship C's enforcement migration or legacy-removal changes.
 Destructive migrations must be released only after the previously serving image
 has stopped reading and writing the legacy schema. The service automatically
 runs every registered migration before it becomes healthy.
@@ -81,9 +109,13 @@ the verified repository ID for each logical operation, without a token cache.
 or bot-token revocation deletes the row instead of setting lifecycle timestamps.
 - No generic integration `status`, `provider_key`, `revoked_at`, or
 `uninstalled_at` columns are introduced.
-- This implementation uses operator-assisted onboarding. Before beta launch, a
-  separate follow-up will add an invite-only onboarding page for Slack OAuth and
-  GitHub App installation. Automated workflow PR creation remains deferred.
+- This implementation uses operator-assisted onboarding. PR B2 supplies the
+  public hosted Slack OAuth installation flow needed to obtain additional
+  workspaces' bot tokens and test isolation before deploying C. Installation
+  requires Slack approval; tenant pairing and activation remain operator-only.
+  The full invite-only customer
+  onboarding page and GitHub App connection UI remain a separate pre-beta
+  follow-up. Automated workflow PR creation remains deferred.
 
 ## Non-goals
 
@@ -93,9 +125,12 @@ or bot-token revocation deletes the row instead of setting lifecycle timestamps.
 - Persisting repository names merely to call GitHub APIs.
 - Full GHES or multi-issuer support. A custom issuer remains a configuration
 seam, not a support claim.
-- Building the invite-only onboarding page in this implementation. It is a
-  separate pre-beta requirement, not deferred beyond beta.
-- Public self-serve onboarding, subscription, and billing UI.
+- Building the full invite-only customer onboarding page in this
+  implementation. It is a separate pre-beta requirement; hosted Slack OAuth
+  with public installation initiation and operator-controlled activation in PR B2
+  is in scope.
+- Full self-serve tenant signup/activation, subscription, and billing UI. The
+  fixed public OAuth start route and minimal completion/error responses are in scope.
 - GitHub user OAuth or trusting a GitHub setup-URL `installation_id` directly.
 - An outbox/reconciliation worker for already accepted side-effect failure
 windows.
@@ -548,14 +583,17 @@ GitHub client boundaries are enough for the accepted beta scope.
 
 Add a `provision-tenant` subcommand to the compiled service admin CLI described
 below. It is the temporary onboarding control plane for development and internal
-testing until the separate invite-only OAuth onboarding page is built before
-beta launch.
+testing until the separate invite-only onboarding page is built before beta
+launch. PR B2 automatically exchanges Slack installation codes and stores
+verified tokens encrypted on the existing backend. This command consumes a
+pending installation by ID; the operator does not copy or pass its plaintext token.
 
 Inputs:
 
 - optional existing tenant UUID, otherwise generate one;
-- a Slack bot token read from a non-echoing prompt/stdin, never a command-line
-flag or log line;
+- either a B2 pending Slack installation ID, or a legacy/manual bot token read
+  from a non-echoing prompt/stdin; reject ambiguous combinations and never accept
+  plaintext secrets in command-line flags or log lines;
 - a GitHub installation ID as a decimal string;
 - optional selected Slack channel ID.
 
@@ -585,10 +623,16 @@ installation after validation.
 explicit operator-only replacement mode and a clear audit log; default is to
 refuse.
 
-The invite-only onboarding follow-up will add Slack OAuth and GitHub post-install
-callbacks. They must call the same validated provisioning operations. The GitHub
-setup callback must not trust its query-string `installation_id` without user or
-webhook-backed verification.
+PR B2 handles Slack OAuth approval, code exchange and encrypted pending-token
+storage on the hosted backend through the fixed public `/api/slack/oauth/start`
+URL.
+Starting OAuth requires no operator-issued invitation or application account;
+successful installation alone grants no Feature-Rec tenant access. The operator
+confirms the verified workspace and supplies the final GitHub/channel pairing.
+The later invite-only onboarding follow-up reuses that exchange/validation logic
+and the same provisioning operations, and adds the customer-facing flow and
+GitHub post-install callback. The GitHub setup callback must not trust its
+query-string `installation_id` without user or webhook-backed verification.
 
 ### Production admin command
 
@@ -724,8 +768,10 @@ Cutover runbook:
 7. Deploy B with no mixed old/new request handling.
 8. Switch each workflow to the pinned OIDC action revision and remove its dead
  `FEATURE_REC_RUNNER_TOKEN` reference.
-9. Provision the second test tenant and run the two-tenant smoke matrix below.
-10. Resume runner traffic.
+9. Verify the existing tenant's complete OIDC-to-Slack-to-GitHub cycle.
+10. Resume that tenant's runner traffic. Finish PR B2 and the two-tenant smoke
+ matrix below before declaring the first observation window complete or
+ merging/deploying C.
 
 The cycle-key builder, unique lookup, advisory lock, and supersession predicate
 must switch in the same deploy. There must be no period where two instances use
@@ -754,11 +800,297 @@ operator can redeploy A and re-enable the old secrets. Once additional tenants
 or C-written rows exist, deploy A cannot represent the data safely; use a B
 hotfix/roll-forward or restore the pre-cutover backup instead.
 
+### PR B2 — hosted Slack OAuth installation
+
+Purpose: install the same Slack app in any additional workspace and obtain its
+workspace-specific bot token automatically on the existing backend. After the
+user approves in Slack, the callback exchanges and stores the token without an
+operator running a helper process, setting up a local tunnel, or handling a token
+file. Two real tenants are the minimum live isolation test before C, not a
+supported-tenant limit. No workspace, tenant, GitHub owner or installation is
+hardcoded. One Slack workspace and one GitHub account/installation per tenant
+remain the beta cardinality rules; load capacity is a separate validation concern.
+
+Implementation choice for B2: use `@slack/oauth` on the existing Fastify backend.
+
+- Use `InstallProvider` for installation redirects, OAuth state-cookie checks and
+  the `oauth.v2.access` exchange. Set `directInstall: true` so the public start
+  route redirects directly to Slack, without an SDK landing page. Keep OAuth v2,
+  state verification enabled and legacy cookie-less verification disabled.
+- Supply small PostgreSQL `StateStore` and `InstallationStore` adapters using the
+  single additive table below. The state store generates unpredictable state,
+  persists only its hash and atomically claims unexpired sessions. The installation
+  store stages only verified, encrypted pending credentials; SDK memory/file stores
+  and its runtime `authorize()` path are not used for pending installations.
+- Retain a separate unpredictable browser-binding cookie, independent of OAuth
+  state, with Secure/HttpOnly/SameSite=Lax and matching expiry. The callback route
+  verifies its hash against the matching session before entering the SDK handler;
+  `StateStore.verifyStateParam` then atomically claims that session before exchange.
+  Do not defer browser-binding validation to `beforeInstallation`, which runs
+  after state verification. Keep per-attempt data in request/session context, never
+  mutable shared installer fields. The SDK has no SameSite setting: the thin HTTP
+  response adapter adds `SameSite=Lax` to its state-cookie header before headers
+  are sent, preserving the independent cookie and both cookie-deletion headers.
+- Use `afterInstallation` to validate the SDK's normalized `Installation` before
+  storage, including the existing `SlackClient.botIdentity()` team/bot-user
+  cross-check. Reuse existing encryption and provisioning operations. Any metadata
+  used to associate storage with the claimed session is generated by the backend
+  and recovered from the state store; it cannot come from installer query inputs.
+- Configure a bounded network timeout and
+  `clientOptions: { retryConfig: { retries: 0 }, rejectRateLimitedCalls: true }`.
+  Supply a logger that drops raw SDK arguments/errors and logs only allowlisted
+  safe categories, plus minimal success/failure callbacks and the route-level
+  query redaction and response headers specified below. Disabling debug logging
+  alone is insufficient. Do not reuse error formatting that includes provider bodies.
+- Keep this a thin integration with the existing service. Use supported SDK hooks
+  and stores; no Bolt migration, SDK fork, Slack-response body interception or generic
+  OAuth framework is required. Add the dependency and lockfile during B2
+  implementation and verify the selected version against this contract.
+
+Accepted SDK behavior: one outstanding installation per browser cookie context;
+starting a second tab or a callback that clears the state cookie can require a
+fresh start. Different browsers and database records remain isolated. Validation
+uses the normalized installation object: reject exposed refresh/expiry fields and
+enterprise-wide installs, with token rotation disabled in Slack configuration.
+The SDK can omit an isolated malformed raw refresh/expiry field during
+normalization, so B2 does not promise exhaustive validation of Slack's raw response
+envelope. This is an explicit boundary of using the SDK without interception.
+
+Romain selected the SDK on 2026-09-09 after the behavior/guarantee comparison,
+superseding the earlier native-HTTP choice. Basis:
+[official SDK documentation](https://docs.slack.dev/tools/node-slack-sdk/oauth/),
+[configuration options](https://docs.slack.dev/tools/node-slack-sdk/reference/oauth/interfaces/InstallProviderOptions/),
+[callback hooks](https://docs.slack.dev/tools/node-slack-sdk/reference/oauth/interfaces/CallbackOptions/)
+and [installer source](https://github.com/slackapi/node-slack-sdk/blob/main/packages/oauth/src/install-provider.ts),
+checked on 2026-09-09. This selects the implementation approach; it does not
+implement or release B2.
+
+One-time app/backend configuration:
+
+- Enable unlisted Slack distribution; Marketplace listing is unnecessary for
+ these tests. Keep using the same Slack app and app-level signing secret.
+- Configure `SLACK_APP_ID`, `SLACK_CLIENT_ID`, and `SLACK_CLIENT_SECRET` on the
+ existing backend. OAuth client credentials are distinct from the signing secret;
+ reuse the existing stable token-encryption key and its key-verifier checks.
+- Register `https://<backend-host>/api/slack/oauth/callback` in Slack's OAuth
+ redirect URLs. Derive the exact redirect URI from the validated public
+ `FEATURE_REC_BASE_URL` and this fixed path; use it for authorization and exchange.
+ No additional server or callback-hosting service is needed.
+- OAuth is disabled when its optional configuration is absent; existing runtime
+ flows continue. Partial/invalid configuration fails explicitly. Normal health
+ and startup must not require a live Slack call. Do not assume `railway run`
+ can retrieve sealed credentials.
+
+Hosted flow and authorization boundary:
+
+1. Expose `GET /api/slack/oauth/start` publicly on the running backend when
+ OAuth is configured. Its URL is `FEATURE_REC_BASE_URL` plus this fixed path and
+ is the same for every installer in that deployment. A user opens this URL in
+ their browser; sharing it directly or linking an Add to Slack button is optional.
+ No per-customer URL generation, invitation command, invitation secret or separate
+ installation landing page is required. Public access permits starting OAuth
+ without an application login or operator invitation; it does not grant Slack
+ permissions or pair or activate a tenant.
+2. On each start request, create an expiring OAuth session bound to that browser
+ with a Secure/HttpOnly/SameSite=Lax cookie, then redirect to Slack's approval flow
+ with unpredictable single-use state. The entry URL is fixed; the session secrets
+ and Slack authorization redirect are generated for each attempt. Persist only
+ hashes of state/browser-binding secrets. For this hosted flow, users begin at
+ the start route; callbacks without a valid matching backend-created session are
+ rejected. Rate-limit starts and bound
+ abandoned-session storage through expiry and cleanup.
+3. Request the required bot scopes: `chat:write`, `files:write`, `usergroups:read`,
+ `channels:read`, `groups:read`, and `commands`. The user selects the intended
+ workspace and approves access. No user-token scopes or GitHub OAuth are added.
+4. `GET /api/slack/oauth/callback` validates state, browser binding and expiry,
+ rejects denial/missing code and repeated callbacks, and atomically claims the
+ session before exchanging the code through `oauth.v2.access`. Use the configured
+ client credentials and exact registered redirect URI. OAuth callbacks use state
+ and browser binding, not the signature check for Slack event/command requests.
+ Never blindly retry an ambiguous exchange; an interrupted/uncertain attempt
+ requires fresh authorization rather than replaying a potentially spent code.
+5. Validate the SDK's successful normalized installation: configured app ID,
+ workspace identity, bot token type, bot user ID and granted scopes; cross-check
+ the returned team and bot user identity with `auth.test`. There is no
+ invitation-bound expected team: derive the team ID from verified Slack responses,
+ never callback parameters or an optional workspace-selection hint. The operator
+ confirms this workspace before provisioning. Require token rotation disabled;
+ reject refresh/expiry fields exposed by the SDK, unexpected user tokens and
+ enterprise-wide installations. Do not silently treat these as workspace bot
+ installations. The normalized-response boundary above applies; B2 does not
+ independently parse the raw exchange response.
+6. Encrypt the verified pending bot token in PostgreSQL using the existing
+ stable key and verified team ID as AAD. The existing backend serves a minimal
+ sanitized completion page stating that the Slack app is installed and Feature-Rec
+ activation is pending operator provisioning. Include the opaque pending
+ installation ID and verified workspace ID for operator handoff. This completion
+ response requires no separate frontend application or onboarding website.
+ These identifiers grant no token access or provisioning authority. Bot tokens, ciphertext,
+ client secrets and OAuth response bodies never appear in browser output, URLs,
+ normal CLI output or logs. OAuth necessarily carries code/state in protocol
+ redirect/callback URLs; never display them on completion pages, log them or
+ persist their raw values. Redact full query strings on start/callback routes;
+ use no-store/no-referrer responses and no third-party content on these pages.
+7. The operator confirms the pending record's verified workspace, invites the bot
+ to the intended channel, then calls existing
+ `provision-tenant` with a new `--slack-installation-id` token source plus GitHub
+ installation/repository and channel inputs. Fetch/decrypt the pending token
+ internally and reuse existing Slack/GitHub validation, encryption, uniqueness
+ and re-pairing guards. Only successful provisioning enables the tenant; callback
+ parameters cannot choose tenant IDs, GitHub pairings, channels or replacement
+ mode. Keep the existing manual-token input path for compatibility.
+ Pending tokens are available only to installation validation and provisioning;
+ runtime handlers continue to require an enabled, paired tenant and must not use
+ staged credentials to run reviews, change tenant settings or access GitHub.
+8. Consume the pending installation and clear its staged ciphertext in the same
+ transaction as final integration writes and tenant activation. Concurrent
+ provisioning attempts must not consume it twice. Validation/transaction failure
+ leaves a bounded, retryable pending installation and existing tenants unchanged;
+ a lost success response is recoverable by inspecting the sanitized record status.
+ Reinstallation must not replace an active tenant's token before its explicit
+ provisioning validation succeeds.
+ Keep environment/confirmation checks on provisioning writes. Provide read-only
+ admin inspection of installation ID, verified team/bot IDs, expiry, lifecycle
+ status and consumed result identifiers for pairing and lost-response recovery;
+ do not expose a public installation listing or token-retrieval endpoint.
+
+Persistence and release boundaries:
+
+- Add `0009_slack_oauth_installations`, containing a narrowly scoped pending
+ installation/session table: opaque ID, hashed state/browser binding,
+ expiry and lifecycle/claim fields, verified workspace/bot IDs,
+ encrypted pending token, and consumed result identifiers. These are temporary
+ OAuth-session states, not generic lifecycle columns on active integrations.
+- Use the shared database for atomic session claims and consumption across replicas.
+ Normal restarts preserve unexpired unclaimed sessions and completed exchanges.
+ A crash during a claimed external exchange must surface a fresh-authorization
+ path; never imply exactly-once execution of Slack's external API.
+- Enforce expiry during every claim/provisioning operation; expired records may
+ be inspected only as sanitized status and may never be consumed. Provide bounded
+ cleanup for expired/consumed records and ciphertext, and rate-limit the public
+ OAuth entry points to bound session/pending-record growth. Installations in
+ different browser cookie contexts and database records stay independent. Invalid
+ callbacks must not claim or mutate an unrelated database session. Within one
+ browser cookie context, accept the SDK restart behavior described above.
+- B2 retains all B legacy reads/writes and registers only through its new additive
+ `0009`. It does not include C's enforcement or D's contract migration. Since C
+ is unshipped, rename its enforcement migration to `0010_multitenant_enforce` and
+ reserve `0011_multitenant_contract` for D when integrating the implementation.
+ Update static providers, fixtures, rollback tests and runbooks together. Do not
+ renumber already applied production migrations; verify the deployed version
+ before applying this sequence.
+- B2's down migration removes only its pending-installation storage. Before
+ B2-to-B rollback, stop new installations, back up and explicitly cancel pending
+ sessions, then migrate down using B2 before redeploying B. Active provisioned
+ tenants/tokens remain in the existing tables. C-to-B2 retains OAuth storage.
+
+Acceptance and release gate:
+
+- Test that the same fixed start URL redirects directly to Slack for different
+ installers without invitations, application login or an SDK landing page, with
+ independent records and unpredictable state for each attempt. Test rate
+ limiting/cleanup, expiration, denial, missing code, wrong app or inconsistent
+ workspace/bot identities across the normalized installation and `auth.test`,
+ missing scopes, malformed normalized fields, exposed refresh/expiry fields,
+ unexpected user tokens, enterprise-wide installs and secret-free output/logging.
+- Verify that possession of callback code/state and a reconstructed SDK state
+ cookie alone cannot claim a session without the independent browser secret.
+ Exercise actual SDK handler ordering, cookie attributes and clearing; a failed
+ browser check must occur before the atomic claim. Cover same-browser second-tab
+ and invalid-callback restart behavior without affecting other database records.
+- Verify that transient/network and rate-limit failures do not retry code exchange,
+ and that SDK errors/debug paths cannot log raw URLs, credentials or responses.
+ Pin the normalized-response validation boundary in coverage; do not claim to
+ inspect fields the SDK discards.
+- Verify sanitized completion/status exposes the installation ID and verified
+ workspace for operator handoff. Unpaired installations and forged callback
+ tenant/GitHub/channel/replacement inputs must never activate service access,
+ trigger product workflows or replace an active integration.
+- Test simultaneous independent installations, duplicate callback races, replica
+ handoff and restart, ambiguous code-exchange failure, pending-token expiry,
+ failed provisioning/retry, atomic consumption, and same-team reinstall isolation.
+- Include at least three distinct workspace/GitHub-owner pairs in automated
+ coverage. Adding another tenant uses the same routes and configuration; no
+ special first/second-tenant path or total-tenant cap is introduced.
+- Verify migration forward/down/forward and older-artifact ordering, compiled
+ admin commands, and backend startup/health with OAuth configured and disabled.
+- Install the same app in at least two real workspaces through hosted callbacks,
+ provision distinct tenants, and complete the end-to-end smoke matrix below.
+- Complete B's observation checks, require a clean
+ `validate-contract-readiness --require-future-cycle-keys` report, and retain a
+ fresh backup before merging/deploying C. Record evidence rather than relying
+ only on elapsed time.
+
+Deliverables are backend routes, shared-database session/token persistence,
+compiled provisioning/status operations, focused tests and the one-time Slack configuration /
+install / provisioning runbook. Full customer onboarding UI, public signup,
+GitHub setup callbacks and automatic tenant activation remain outside B2.
+No separate installation landing page or Add to Slack button UI is required;
+keep the minimal backend-served callback completion/error responses.
+
+Preserve the already implemented C work on its own branch. Prepare B2 from the
+deployed B baseline, then integrate it into C and update the unshipped migration
+names above. C development/review can continue in parallel; its merge/deploy is
+gated on B2 and the first two-workspace observation/readiness gate.
+
+#### B2 development milestones
+
+These seven milestones build on earlier completed work; each has its own
+verification gate. The later reliability milestone adds cross-cutting coverage
+rather than postponing checks for earlier work. Follow the detailed B2 contract
+above throughout.
+
+1. **SDK setup and configuration (implemented 2026-09-09).** Add `@slack/oauth` to the existing backend,
+   configure client credentials and the fixed redirect URI, and establish safe
+   logging, bounded timeouts and disabled retries.
+   **Verify:** the service builds; startup/health needs no live Slack call; absent
+   OAuth configuration disables the feature and partial/invalid configuration fails.
+2. **Persistent installation storage.** Add B2 migration `0009` and storage
+   operations for hashed session secrets, atomic claims, encrypted pending tokens,
+   expiry, consumption and bounded cleanup.
+   **Verify:** seeded database tests pass for duplicate/expired claims, encryption
+   and ciphertext cleanup; migration forward/down/forward preserves active tenants.
+   Keep C/D migration renumbering within the integration boundary specified above.
+3. **Public installation start.** Implement the fixed start route using the SDK's
+   direct redirect, fresh state, independent browser binding, the cookie-header
+   adapter and rate limiting.
+   **Verify:** HTTP tests observe the Slack redirect, required scopes and both
+   cookies' security attributes; attempts get distinct state and excess starts
+   are limited without modifying existing sessions.
+4. **OAuth callback and pending installation.** Verify browser binding, let the
+   SDK claim state and exchange the code, validate its normalized installation,
+   cross-check Slack identity, and stage the encrypted token with a safe completion
+   response.
+   **Verify:** actual SDK handlers against fake Slack endpoints produce one pending
+   record on success; invalid, expired or replayed callbacks cannot stage tokens;
+   identity/scope/token-model checks, cookie cleanup and secret redaction pass.
+5. **Operator provisioning and status.** Extend `provision-tenant` with
+   `--slack-installation-id` and add sanitized status inspection. Reuse existing
+   pairing checks and atomically activate the tenant, consume the installation and
+   clear its staged ciphertext; retain manual-token input.
+   **Verify:** compiled CLI tests cover successful activation, unchanged tenants
+   after validation/transaction failures, retryable pending records, status-based
+   recovery and the existing manual-token path.
+6. **Concurrency, recovery and tenant isolation.** Exercise the complete flow
+   across replicas/restarts, concurrent callbacks/provisioning, reinstalls and
+   interrupted exchanges, including the accepted SDK browser-restart behavior.
+   **Verify:** tests with at least three workspace/GitHub pairs prove single
+   consumption, no automatic exchange retries, no cross-tenant effects or staged
+   token use by runtime handlers, and safe recovery without secret leakage.
+7. **Live verification and release readiness.** Complete the configuration and
+   operations runbook, packaged-image checks, rollback rehearsal and hosted
+   installation/provisioning in two real workspaces.
+   **Verify:** both tenants pass the end-to-end smoke matrix; record migration/
+   rollback and observation evidence, a clean contract-readiness report and a
+   fresh backup before allowing C to merge/deploy. Keep C's existing work separate
+   and verify its migration renumbering when integrating B2.
+
 ### PR/deploy C — enforce and stop legacy dependency
 
-Only after the first observation window and a fresh backup, add:
+Only after PR B2, the real two-workspace smoke, the first observation window,
+a clean readiness report, and a fresh backup, release:
 
-`0009_multitenant_enforce`:
+`0010_multitenant_enforce`:
 
 1. Abort if any review cycle has null tenant/repository IDs.
 2. Abort if channel settings refer to an absent Slack workspace.
@@ -788,7 +1120,7 @@ references the legacy fields/table.
 Only after deploy C is serving, the second observation window is clean, and a
 fresh backup exists, add:
 
-`0010_multitenant_contract`:
+`0011_multitenant_contract`:
 
 1. Drop `team_channel_routes`.
 2. Drop `review_cycles.owner` and `review_cycles.repo`.
@@ -805,12 +1137,12 @@ pre-cutover binaries are no longer rollback-compatible.
 
 The old deploy C process can continue serving while deploy D runs because deploy
 C does not read or write the schema being dropped. A fresh C process cannot
-start while the database records `0010`, however; Kysely rejects an executed
+start while the database records `0011`, however; Kysely rejects an executed
 migration missing from that binary's static provider. D-to-C therefore requires
-rolling the database back to `0009` with deploy D's admin command before
+rolling the database back to `0010` with deploy D's admin command before
 redeploying C.
 
-Do not put migrations 0008 through 0010 into one automatically deployed artifact.
+Do not put migrations 0008 through 0011 into one automatically deployed artifact.
 With `migrateToLatest()`, that would collapse expand and contract before the
 application-assisted backfill and observation steps can occur.
 
@@ -846,9 +1178,15 @@ Targets:
   index, columns, and integration tables.
 - B to A: no migration down because both register through `0008`; apply the
   singleton/data qualification described above.
-- C to B: migrate to `0008_multitenant_expand` using artifact C.
-- D to C: migrate to `0009_multitenant_enforce` using artifact D.
-- D to B: migrate to `0008_multitenant_expand` using artifact D. Rolling farther
+- B2 to B: cancel pending installations and migrate to
+  `0008_multitenant_expand` using artifact B2 before starting B.
+- C to B2: migrate to `0009_slack_oauth_installations` using artifact C.
+- C to original B: after the pending-installation precautions, migrate to
+  `0008_multitenant_expand` using artifact C; this also removes B2 session storage.
+- D to C: migrate to `0010_multitenant_enforce` using artifact D.
+- D to B2: migrate to `0009_slack_oauth_installations` using artifact D.
+- D to original B: after the pending-installation precautions, migrate to
+  `0008_multitenant_expand` using artifact D. Rolling farther
   back to A requires the singleton reverse-data validator or a backup restore.
 
 PostgreSQL transactional DDL and Kysely's migration lock/bookkeeping make each
@@ -859,16 +1197,21 @@ removed. Test every forward/down/forward path; do not treat `down()` as ceremoni
 
 ### Autodeploy and PR topology
 
-Use four PRs because each merge autodeploys:
+Use five PRs because each merge autodeploys:
 
 1. PR A: expand migration, compatibility behavior, compiled admin tooling.
 2. PR B: OIDC/multitenant cutover, with legacy writes retained for its observation
    window.
-3. PR C: enforce constraints and stop every legacy read/write.
-4. PR D: contract migration and final cleanup.
+3. PR B2: hosted Slack OAuth and additive `0009_slack_oauth_installations`;
+   obtain pending workspace tokens automatically and complete the first
+   two-tenant validation gate using existing controlled provisioning.
+4. PR C: enforce constraints and stop every legacy read/write after B2 passes.
+5. PR D: contract migration and final cleanup.
 
 Do not put a later wave's migration in an earlier PR. In particular, C and D
 must be separate because C must be healthy and observed before D drops schema.
+B2 must also exclude C's migration and legacy-removal changes. Rebase/integrate
+the already prepared C work after B2 without collapsing their release gates.
 Two PRs would only be possible by shipping dormant cutover/stop-legacy paths in
 PR A, controlling them with production feature flags, and manually observing
 each flag transition before PR D. That adds rollout state and rollback cases
@@ -958,6 +1301,27 @@ non-idempotent comment write.
 - Add dry-run/apply backfill, rollback-readiness, contract validators, and tested
   migration-down paths.
 
+### PR B2 hosted Slack OAuth and runbook
+
+- Add installation-start and callback routes to the existing Fastify service
+ with `@slack/oauth` and validated optional configuration. Follow the B2
+ implementation choice above: thin Fastify integration, PostgreSQL state and
+ pending-installation stores, independent browser binding, safe logging and
+ responses, and disabled exchange retries. Reuse existing Slack identity checks,
+ encryption and provisioning code.
+- Add `0009_slack_oauth_installations`, storage claim/consume/expiry operations,
+ and integration with existing token encryption/key verification.
+- Extend existing `provision-tenant` to consume an installation ID atomically and
+ provide sanitized read-only installation inspection in the compiled admin CLI.
+ Opening the fixed public start URL needs no admin command. Reuse the provisioning
+ transaction/guards; do not create a second integration-writing implementation.
+- Add provider-fake HTTP/storage/admin tests for B2 acceptance and image smoke.
+- Update `docs/setup-and-operations.md` with backend client credentials, exact
+ Slack redirect URL, fixed public start URL, pending-installation ID handoff,
+ cleanup and migration-aware rollback. No local callback server/tunnel/token file.
+- When integrating C, rename its unshipped enforcement to `0010` and update
+ providers/test fixtures/runbooks; leave D's contract for `0011`.
+
 ### `packages/service/src/admin.ts` and build
 
 - Add the compiled admin subcommands described above; do not leave production
@@ -1029,12 +1393,13 @@ Use an in-process JWKS/discovery server and generated RSA keys:
 - Selected-channel dual writes cannot drift under concurrent updates.
 - Enforce migration refuses null/orphan rows.
 - Contract migration succeeds only after readiness and leaves the expected schema.
-- Exercise `0008`, `0009`, and `0010` in forward/down/forward order and verify
+- Exercise `0008`, B2 `0009`, C `0010`, and D `0011` in forward/down/forward
+  order and verify
   both schema and Kysely migration-table state after each step.
 - Verify the compiled admin command exits nonzero on migration error or an
   unexpected current migration and never deploy the older fixture first.
-- Slack workspace deletion explicitly removes channel settings before `0009`
-  and remains idempotent with the cascade after `0009`; tenant/cycles remain and
+- Slack workspace deletion explicitly removes channel settings before `0010`
+  and remains idempotent with the cascade after `0010`; tenant/cycles remain and
   the tenant becomes disabled.
 
 ### Runner HTTP tests
@@ -1121,7 +1486,9 @@ fails.
 With two real test tenants:
 
 1. Install the GitHub App on one repository per tenant.
-2. Install the Slack app in two workspaces and select different channels.
+2. Open the same fixed B2 start URL for each additional Slack workspace and
+ complete Slack approval and the callback. Provision by pending installation ID
+ and select different channels.
 3. Confirm both workflows use a pinned action revision and grant
  `permissions: id-token: write`, then run them simultaneously.
 4. Confirm check runs, videos, messages, settings, approvals, comments, and
@@ -1177,7 +1544,15 @@ The command exits nonzero on any contract blocker and prints no secrets.
 
 ## Acceptance criteria
 
-- At least two tenants work concurrently from one backend and database.
+- PR B2 accepts public installation initiation without invitation issuance;
+ protected OAuth sessions and Slack approval remain required. It automatically
+ exchanges each installation code and stores the verified
+ workspace bot token encrypted on the existing backend. Existing provisioning
+ consumes an opaque installation ID without operator plaintext-token handling.
+- There is no fixed total-tenant cap or per-tenant backend code/configuration
+ change; two real tenants are the minimum live isolation test.
+- At least two tenants work concurrently from one backend and database before
+ C is merged/deployed; C implementation alone does not satisfy this gate.
 - No runner request relies on a shared secret or caller-provided tenant/repository
 name for identity.
 - Every runner mutation is bound to verified tenant, repository, and attempt.
@@ -1194,10 +1569,11 @@ name for identity.
 - Deploy B can roll back to A only after the singleton/data rollback validator;
   once multiple tenants exist, A is not a supported target without restoring the
   pre-cutover backup.
-- Deploy C can roll back to B only after artifact C migrates the database down to
-  `0008`; deploying B first is a tested startup failure.
+- Deploy C can roll back to B2 only after artifact C migrates to B2's `0009`;
+  rollback to original B requires removal of pending OAuth storage too, down to
+  `0008`. Deploying either older artifact first is a tested startup failure.
 - Deploy D can roll back to C only after artifact D migrates the database down to
-  `0009`; deploying C first is a tested startup failure.
+  `0010`; deploying C first is a tested startup failure.
 - Contract runs only after deploy C has removed legacy reads/writes, its
 observation window is clean, and a backup is verified.
 - `team_channel_routes`, legacy repository names/config, shared runner token, and
@@ -1213,8 +1589,10 @@ requirement below must also be complete.
 Build an invite-only onboarding page that lets an invited customer connect Slack
 through OAuth and install/connect the GitHub App. Its callbacks reuse the
 validated tenant-provisioning operations built here rather than duplicating
-integration-writing logic. Invite authorization, page UX, OAuth state handling,
-and the exact onboarding persistence belong in a separate reviewed plan.
+integration-writing logic. Reuse B2's hosted OAuth routes, durable state, and
+encrypted pending-installation handling. Customer-facing invite management, page
+UX, GitHub connection and the orchestration of final provisioning belong in a
+separate reviewed plan; the basic hosted Slack callback is delivered in B2.
 
 The page may provide manual workflow-installation instructions. Automatically
 opening workflow PRs remains deferred.
@@ -1296,7 +1674,8 @@ them would break requests during Railway health-gated handoff; the no-legacy
 deploy must become healthy before the contract migration is present.
 - Treating a single PR as four deployable checkpoints is unsafe under the current
   merge-triggered autodeploy. Use four PRs, and no earlier PR may register a later
-  migration.
+  migration. The 2026-09-08 B2 amendment adds a fifth PR; the original four
+  schema/runtime waves remain separate.
 - Cutting over while old-token workflows are still rendering would make their
 result callbacks fail authentication; pause, drain or cancel them first.
 - Deleting a revoked Slack workspace without disabling its tenant leaves an
@@ -1350,9 +1729,12 @@ repositories; it must report and stop rather than guess or silently delete.
 - With merge-triggered autodeploy, PR boundaries are deployment boundaries. The
   four safe A/B/C/D artifacts therefore require four PRs; compressing them into
   two would require additional runtime rollout flags and manual transition state.
+  Updated 2026-09-08: B2 adds an operator-tooling PR between B and C.
 - Describing onboarding UI/OAuth as deferred beyond beta contradicts the launch
   scope. The invite-only page is a separate pre-beta requirement, while this
-  implementation deliberately stops at temporary operator provisioning.
+  implementation deliberately stops at temporary operator provisioning. Updated
+  2026-09-08: B2 includes the operator Slack OAuth helper; the full UI remains
+  separate.
 
 ## Plan caveats from PR B review validation (2026-09-05)
 
@@ -1424,3 +1806,278 @@ repositories; it must report and stop rather than guess or silently delete.
 - Regression coverage includes healthy-token reuse during a mint outage, both
   sides of the expiry margin, expiry during delivery, invalid grant expiry, and
   failed reacquisition with independent Slack cleanup.
+
+## PR B2 sequencing amendment (2026-09-08)
+
+Historical first proposal: the local-helper topology below is superseded by the
+hosted B2 revision that follows. The B2-before-C and many-tenant requirements remain.
+
+- User decision: add the minimal Slack OAuth installation helper as PR B2 before
+ releasing C; the full invite-only onboarding UI remains a separate pre-beta task.
+- Resolved plan gap: the earlier B smoke assumed a second workspace token was
+ already available while all OAuth handling was deferred. B2 now covers the
+ installation approval/code exchange and secure operator token handoff.
+- Resolved sequencing gap: C is implemented but must not autodeploy before B2,
+ the real two-workspace smoke, observation/readiness, and fresh backup. Preserve
+ the existing C work and integrate it after B2; no C migration ships in B2.
+- Resolved scope ambiguity: the helper is a one-shot operator process, not a
+ public callback that displays tokens or automatically provisions arbitrary
+ tenants. Installation handling does not grant Feature-Rec service access.
+
+- User clarification: support arbitrary additional tenants through the same
+ repeatable B2 flow; two is only the minimum live isolation test. Added automated
+ three-or-more-tenant coverage, explicit absence of hardcoded identities or a
+ two-tenant cap, and the distinction between manual onboarding and load capacity.
+
+
+## PR B2 hosted OAuth revision (2026-09-08)
+
+Historical revision: its operator-issued installation-link requirement is
+superseded by the 2026-09-09 simplification below; hosted OAuth and controlled
+tenant activation remain.
+
+- User decision: use the already running backend for OAuth. Replace the temporary
+ local helper with hosted start/callback routes, one-time Slack configuration,
+ automatic code exchange and encrypted token storage. No additional server,
+ per-install helper process, local tunnel or token file is needed.
+- Resolved persistence gap: callback state and pending tokens must survive normal
+ restarts and replica changes. Add B2 migration `0009_slack_oauth_installations`;
+ the earlier no-migration promise is superseded. Rename the unshipped C/D
+ migrations to `0010`/`0011` during implementation integration; this amendment
+ does not rename or otherwise modify the existing C code.
+- Resolved authorization gap: operator-issued expiring installation links and
+ browser-bound single-use state authorize OAuth; callback parameters never pair
+ GitHub, overwrite another tenant or activate service access.
+- Resolved token-handoff gap: the backend retains only encrypted pending tokens;
+ the existing provisioning transaction consumes them by opaque ID and validates
+ both integrations before enabling the tenant. A failed/repeated request cannot
+ lose another tenant's token or double-consume the pending installation.
+- Resolved rollback gap: B2-to-original-B cancels pending installs and migrates
+ down before restoring B; C-to-B2 retains OAuth storage. Historical C `0009` and
+ D `0010` references in earlier review notes describe the superseded numbering.
+- Many-tenant support, at least three automated tenants, the real two-workspace
+ test before C and the later full onboarding UI remain unchanged in scope.
+
+- Resolved review wording issue: OAuth protocol URLs necessarily carry temporary
+ code/state. Prohibit their display, logging and raw persistence, with callback
+ query redaction and no-store/no-referrer responses; bot tokens and client
+ secrets remain prohibited in URLs and browser output entirely.
+
+## PR B2 public installation simplification (2026-09-09)
+
+User decision: simplify installation initiation to a public Add to Slack link for
+now. Remove operator-issued invitations while retaining protected OAuth,
+encrypted pending tokens and explicit operator pairing/activation. This updates
+the design only; it does not implement or release B2 or alter C's existing work.
+
+Resolved issues from checking the simplification:
+
+- The prior flow required invitation issuance, redemption and hashed invitation
+  storage. Removed those requirements and the invitation-issuing admin command;
+  the public start route now creates the OAuth session directly.
+- Expected workspace validation depended on the removed invitation. The callback
+  now verifies the configured app and cross-checks Slack-returned workspace/bot
+  identities; the operator confirms the intended workspace before pairing.
+- The operator previously received the record ID at invitation creation. The
+  sanitized completion page now supplies the pending installation ID and verified
+  workspace, with read-only admin inspection for pairing and recovery.
+- Public initiation needs bounded resource use. Retained session/pending expiry
+  and cleanup, added rate-limiting acceptance coverage, and kept independent
+  sessions and atomic callback claims across replicas.
+- A pending Slack token already carries Slack permissions. Explicitly restricted
+  staged-token use to validation/provisioning; unpaired installs cannot activate
+  product workflows, select GitHub pairings or mutate active tenant settings.
+- Reinstallation and concurrent provisioning must not overwrite active tokens or
+  consume a pending installation twice. Retained the existing provisioning guards,
+  atomic activation/consumption, retry behavior and manual-token compatibility.
+- Updated active scope, persistence, deliverables and acceptance wording together;
+  marked the previous invitation requirement as historical. The later full
+  customer onboarding UI and existing release gates are outside this amendment.
+
+## PR B2 installation wording clarification (2026-09-09)
+
+User requested precise design wording after “publish a reusable Add to Slack
+link” suggested a generated invitation or separate webpage. This is a wording
+clarification of the accepted public-initiation design, with no behavior change.
+
+Resolved wording issues:
+
+- “Publish a reusable link” implied a separate publishing or link-generation task.
+  The flow now specifies one fixed public backend start URL per deployment;
+  sharing that URL or adding a button is optional.
+- A fixed entry URL could be confused with reusable OAuth state. The start route
+  generates a fresh protected session and Slack authorization redirect for each
+  attempt; callbacks still require the matching session.
+- “Public” could imply permission to use Slack or Feature-Rec immediately. The
+  text distinguishes starting OAuth from Slack approval and operator-controlled
+  pairing/activation.
+- “No separate webpage” could contradict the completion response. No installation
+  landing page or separate frontend is required; the existing backend still
+  serves the sanitized completion page with the installation ID and activation
+  status. Scope wording now distinguishes these minimal responses from the
+  deferred self-serve tenant signup/activation UI.
+
+## PR B2 minimal implementation choice (2026-09-09)
+
+Historical decision: superseded by the SDK adoption below. This section records
+why native HTTP was originally proposed; it is not the active B2 approach.
+
+User direction: “It should be as simple as possible.” For the current service,
+choose two Fastify routes and a small direct OAuth exchange module, reusing the
+existing Slack client, database, encryption and tenant provisioning. This is a
+design decision; no B2 implementation or dependency change is made by this edit.
+
+Resolved implementation-selection issues:
+
+- The plan named a focused OAuth module without selecting a concrete approach.
+  It now specifies the existing native-HTTP stack and no `@slack/oauth` dependency
+  for B2; the library was an evaluated option, not an earlier accepted choice.
+- Assuming the SDK removes all custom handling would hide adaptation work. Its
+  custom state/store hooks remain necessary for durable claims and staging; its
+  callback normalizes token responses, exposes only part of its identity check,
+  and has different cookie cleanup behavior. A small direct flow keeps these
+  required checks in one place without interception or overrides.
+- The existing Slack error formatter may include provider detail. The OAuth
+  module must sanitize errors at its boundary while reusing identity validation,
+  encryption and provisioning; standardizing unrelated Slack calls is outside
+  this change.
+- Simplicity must not accidentally remove the accepted activation boundary.
+  Public initiation, protected single-use sessions, encrypted pending tokens,
+  operator pairing and atomic activation remain as specified above.
+
+## PR B2 library complexity reassessment (2026-09-09)
+
+Historical review: resolved by the SDK adoption below.
+
+Review issue at the time: the native-HTTP choice above was justified by preserving
+every specified implementation detail, not by a comparison demonstrating the simplest
+way to meet the product requirements. Custom pending storage and provisioning
+are needed with either approach and do not themselves count against the SDK.
+
+Assessment: `@slack/oauth` would probably simplify the standard OAuth portion if
+we accept its supported session and normalized-response behavior, while retaining
+database-backed single-use state, encrypted pending tokens and operator activation.
+Matching every current raw-response/cookie requirement would add adaptation work.
+The SDK recommendation is an estimate from source inspection, not a measured
+implementation comparison. Reconsider the native-HTTP choice; a switch would
+need to update the affected requirements explicitly. No switch is made by this
+review note.
+
+## PR B2 SDK behavior and guarantee comparison (2026-09-09)
+
+Historical comparison: the subsequent SDK adoption below records the accepted
+behavior and retained protections.
+
+Review issue at the time: adopting stock SDK browser behavior is not solely an
+internal refactor. Its cookie contains OAuth state itself. If this replaces the planned
+independent browser-binding secret, a holder of a valid full callback URL could
+reconstruct the expected cookie and attempt to claim the session from another
+client (inference from the inspected SDK implementation). Atomic single-use state
+would still allow only one claim, and completion still exposes no token or tenant
+activation. Keep independent browser binding through route/hook logic if retaining
+the stronger URL-leakage guarantee.
+
+Other explicit tradeoffs if using stock SDK behavior:
+
+- One state cookie per browser means starting another installation can invalidate
+  an earlier tab; an invalid state callback can also clear the ongoing cookie.
+  The user may need to restart. This does not require weakening cross-tenant or
+  database-consumption guards.
+- Validating only the normalized installation object cannot enforce rejection of
+  every malformed raw expiry/refresh-token shape. Normal supported response fields
+  remain checkable; a standalone expiry field can be lost during normalization.
+- Keep Secure/HttpOnly and an explicit SameSite policy, safe logging/response
+  headers, disabled exchange retries (including rate-limit retries), verified
+  app/team/bot/scopes and the auth.test cross-check. These can be retained with
+  configuration and application integration rather than accepted as losses.
+- Keep database-backed atomic state claims, encrypted pending storage, expiry,
+  operator-only pairing and atomic activation/consumption through the SDK's custom
+  state/installation-store hooks and existing provisioning operations. Defaults
+  alone do not implement these guarantees.
+
+This comparison records possible behavior changes; it does not approve relaxing
+any guarantee or switch the implementation choice. Basis: official SDK source
+and documented customization options inspected on 2026-09-09.
+
+## PR B2 SDK adoption (2026-09-09)
+
+User decision: “Yeah let's use the sdk then.” Use `@slack/oauth` for B2's hosted
+OAuth flow. This supersedes the native-HTTP implementation choice; the fixed
+public start URL and operator-controlled tenant activation remain the product flow.
+This amendment changes the design only, not dependencies, runtime code or release
+status.
+
+Resolved issues from reviewing the switch:
+
+- The active implementation and deliverables still prohibited the SDK. They now
+  select `InstallProvider`, `directInstall: true`, supported hooks and small
+  PostgreSQL adapters; previous choices/reviews are explicitly historical.
+- SDK state alone does not preserve independent browser binding. Retain the
+  separate secret and validate it before the SDK's state-store claim; the
+  `beforeInstallation` hook is too late for that check. Keep request/session data
+  isolated and preserve both cookies' policy and cleanup headers.
+- Stock cookie behavior conflicts with the previous blanket promise that all
+  concurrent installations stay usable. Accept same-browser restarts while
+  retaining isolation across browser contexts and database records.
+- Normalized installation objects cannot expose every malformed raw token field.
+  Validate their supported fields and cross-check app/team/bot/scopes, reject
+  exposed refresh/expiry and user tokens plus enterprise-wide installs, and require
+  rotation disabled. Explicitly narrow exhaustive raw-envelope validation instead
+  of adding a fork or response interception to reproduce it.
+- Default SDK stores, retries, logging and completion pages do not implement this
+  application's contract. Specify encrypted pending storage, atomic state claims,
+  both no-retry settings, safe logger/callbacks, query redaction and response headers.
+- SDK installation completion must not activate tenants or replace active tokens.
+  Keep operator provisioning and its existing validations, uniqueness/re-pairing
+  guards, pending expiry and transactional activation/consumption. Scope acceptance
+  checks to the retained guarantees and explicitly accepted SDK behavior.
+- The SDK has no SameSite option. Clarify that the HTTP response adapter adds
+  `SameSite=Lax` to its outgoing cookie header before transmission and preserves
+  both cookies during creation/cleanup. This does not intercept Slack's response
+  body or require an SDK fork.
+
+## PR B2 development milestones (2026-09-09)
+
+At Romain's request, break B2 into seven sequential milestones with independent
+verification gates: SDK/configuration, storage, public start, callback/staging,
+operator provisioning/status, concurrency/recovery/isolation, and live release
+readiness. This organizes the accepted design; it does not change scope or mark
+implementation complete.
+
+Resolved planning clarifications:
+
+- Each milestone verifies its own deliverable; the sixth adds cross-cutting
+  coverage instead of deferring earlier tests.
+- Storage includes bounded cleanup and ciphertext removal; cookie integration
+  includes both setting and clearing headers through actual SDK handlers.
+- Live verification retains the existing B2-before-C release gates and migration
+  integration boundaries.
+
+
+## PR B2 milestone 1 implementation (2026-09-09)
+
+Restored the B2 planning amendment saved in the branch-setup stash; the stash is
+retained. Implemented only SDK setup/configuration on `feat/oidc-multitenancy-pr-b2`.
+
+- Added `@slack/oauth` 4.0.0 through pnpm with the lockfile. The installer factory
+  requires state/installation adapters, uses OAuth v2 with direct installation and
+  state-cookie checks, and sets a ten-second network timeout with ordinary and
+  rate-limit retries disabled. Its logger drops raw SDK arguments and emits fixed
+  warning/error categories.
+- Added all-or-none `SLACK_APP_ID`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`
+  validation and callback derivation from the normalized backend URL. Absent/all-empty
+  credentials disable configuration; partial/invalid credentials fail without
+  including supplied values. Updated environment examples and operations guidance.
+- Verified workspace typecheck and lint, service build, existing PostgreSQL-backed
+  service selftests, and the focused real-SDK selftest. The latter covers direct
+  redirects/scopes, custom stores, state-cookie rejection, no exchange retries for
+  network/503/429 failures, timeout cancellation, and secret-free logging.
+- Built the production image and checked packaged SDK import, compiled admin help,
+  startup/health with OAuth absent and configured, and rejection of partial config
+  against an isolated local database. Focused tests assert no network calls during
+  SDK construction and health checks.
+
+Public OAuth routes, independent browser binding, persistent storage, callback
+validation/staging, and provisioning remain subsequent milestones. No migration
+was added, no C changes were integrated, and B's legacy compatibility writes remain.
+No production configuration, installation, or release was performed.
