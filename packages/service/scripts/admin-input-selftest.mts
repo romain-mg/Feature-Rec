@@ -3,7 +3,7 @@ import { PassThrough } from "node:stream";
 import type { ReadStream } from "node:tty";
 import { parseArgs, readSecret } from "../src/admin-input";
 
-for (const [command, option] of [["migrate-to", "expect-current"], ["provision-tenant", "tenant-id"], ["provision-tenant", "selected-channel-id"]]) {
+for (const [command, option] of [["migrate-to", "expect-current"], ["provision-tenant", "tenant-id"], ["provision-tenant", "selected-channel-id"], ["provision-tenant", "slack-installation-id"], ["slack-installation-status", "slack-installation-id"], ["cancel-slack-installation", "slack-installation-id"]]) {
   assert.throws(() => parseArgs([command, `--${option}`]), /argument missing|requires a value/);
   assert.throws(() => parseArgs([command, `--${option}= `]), /non-empty value/);
   assert.throws(() => parseArgs([command, `--${option}`, "--confirm"]), /argument is ambiguous/);
@@ -17,6 +17,11 @@ const parsed = parseArgs(["migrate-to", "--confirm", "0007_mention_modes", "--ex
 assert.deepEqual(parsed.positionals, ["0007_mention_modes"]);
 assert.equal(parsed.flags.get("confirm"), true);
 assert.equal(parsed.flags.get("expect-current"), "0008_multitenant_expand");
+
+assert.equal(parseArgs(["provision-tenant", "--slack-installation-id", "pending-id"]).flags.get("slack-installation-id"), "pending-id");
+assert.equal(parseArgs(["cancel-slack-installation", "--slack-installation-id", "pending-id", "--confirm"]).flags.get("confirm"), true);
+assert.throws(() => parseArgs(["slack-installation-status", "--confirm"]), /not supported/);
+assert.throws(() => parseArgs(["cancel-slack-installation", "--replace-pairing"]), /not supported/);
 
 class FakeTty extends PassThrough {
   isTTY = true;

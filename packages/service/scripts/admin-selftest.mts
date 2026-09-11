@@ -5,6 +5,9 @@ import { once } from "node:events";
 import { createServer } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { build } from "tsup";
 import { promisify } from "node:util";
 import { Kysely, PostgresDialect, sql } from "kysely";
 import { Migrator } from "kysely/migration";
@@ -20,6 +23,10 @@ import { decryptSlackToken, encryptSlackToken } from "../src/slack-token-crypto"
 import { migrationProvider } from "../src/storage/migrations";
 import type { DB } from "../src/storage/schema";
 import { inspectSlackTokenEncryption } from "../src/storage/slack-token-check";
+import {
+  cancelSlackOAuthInstallation, claimSlackOAuthSession, createSlackOAuthSession, stageSlackOAuthInstallation,
+  getSlackOAuthInstallationStatus, readPendingSlackOAuthInstallation,
+} from "../src/storage/slack-oauth";
 import { GitHubRequestError } from "../src/github";
 
 const adminUrl =
@@ -104,11 +111,11 @@ try {
     timeout: 10_000,
   });
   const status = JSON.parse((await runAdmin(["migration-status"])).stdout);
-  assert.equal(status.migrations.at(-1).name, "0008_multitenant_expand");
+  assert.equal(status.migrations.at(-1).name, "0009_slack_oauth_installations");
   assert.equal(status.migrations.at(-1).status, "executed");
   for (const missing of ["--expect-current", "--service-stopped", "--traffic-paused"]) {
     const flags = ["--confirm", "--service-stopped", "--traffic-paused"];
-    if (missing !== "--expect-current") flags.push("--expect-current", "0008_multitenant_expand");
+    if (missing !== "--expect-current") flags.push("--expect-current", "0009_slack_oauth_installations");
     await assert.rejects(runAdmin(["migrate-to", "0007_mention_modes", ...flags.filter((flag) => flag !== missing)]), /Schema downgrade requires/);
     assert.equal(JSON.parse((await runAdmin(["migration-status"])).stdout).migrations.at(-1).status, "executed");
   }
@@ -118,7 +125,7 @@ try {
   await migrationBlocker.connect();
   try {
     await migrationBlocker.query("select pg_advisory_lock(hashtextextended('feature-rec-migrations', 0))");
-    const competing = Promise.allSettled([0, 1].map(() => runAdmin(["migrate-to", "0007_mention_modes", "--confirm", "--expect-current", "0008_multitenant_expand", "--service-stopped", "--traffic-paused"])));
+    const competing = Promise.allSettled([0, 1].map(() => runAdmin(["migrate-to", "0007_mention_modes", "--confirm", "--expect-current", "0009_slack_oauth_installations", "--service-stopped", "--traffic-paused"])));
     try {
       await waitForBlockedQueries(2);
     } finally {
@@ -130,11 +137,11 @@ try {
   } finally {
     await migrationBlocker.end();
   }
-  await runAdmin(["migrate-to", "0008_multitenant_expand", "--confirm", "--expect-current", "0007_mention_modes"]);
+  await runAdmin(["migrate-to", "0009_slack_oauth_installations", "--confirm", "--expect-current", "0007_mention_modes"]);
   assert.equal(JSON.parse((await runAdmin(["prepare-rollback-to-a", "--dry-run"])).stdout).ok, true);
   await assert.rejects(runAdmin(["validate-contract-readiness"]), /canonical base64/);
 
-  assert.deepEqual(await inspectSlackTokenEncryption(db, null), { keyError: null, invalidWorkspaces: [] });
+  assert.deepEqual(await inspectSlackTokenEncryption(db, null), { keyError: null, invalidPendingInstallations: [], invalidWorkspaces: [] });
   const emptyBackfill = { db, providers, slackBotToken: "xoxb-admin", encryptionKey: key, tenantId };
   const emptyDryRun = await backfillMultitenancy({ ...emptyBackfill, apply: false });
   assert.deepEqual((await backfillMultitenancy({ ...emptyBackfill, apply: true })).issues, emptyDryRun.issues);
@@ -250,7 +257,7 @@ try {
   });
   assert.equal(applied.applied, true);
   assert.equal(applied.validation?.ok, true);
-  assert.deepEqual(await inspectSlackTokenEncryption(db, key), { keyError: null, invalidWorkspaces: [] });
+  assert.deepEqual(await inspectSlackTokenEncryption(db, key), { keyError: null, invalidPendingInstallations: [], invalidWorkspaces: [] });
   assert.match((await inspectSlackTokenEncryption(db, Buffer.alloc(32, 10))).keyError!, /does not match/);
   assert.match((await inspectSlackTokenEncryption(db, null)).keyError!, /ENCRYPTION_KEY is required/);
   const wrongKeyDryRun = await backfillMultitenancy({ ...emptyBackfill, encryptionKey: Buffer.alloc(32, 10), apply: false });
@@ -355,7 +362,19 @@ try {
   assert.equal(invalidCiphertext.ok, false);
   assert.ok(invalidCiphertext.issues.some((issue) => issue.includes("team-bound AAD")));
   // An independently verified key lets even the sole corrupted token remain tenant-local.
-  assert.deepEqual(await inspectSlackTokenEncryption(db, key), { keyError: null, invalidWorkspaces: [{ tenantId, teamId: "TADMIN" }] });
+  assert.deepEqual(await inspectSlackTokenEncryption(db, key), { keyError: null, invalidPendingInstallations: [], invalidWorkspaces: [{ tenantId, teamId: "TADMIN" }] });
+  const pendingSession = await createSlackOAuthSession(db);
+  const pendingClaim = await claimSlackOAuthSession(db, pendingSession);
+  assert.ok(pendingClaim);
+  assert.equal(await stageSlackOAuthInstallation(db, {
+    ...pendingClaim, teamId: "TPENDING", botUserId: "UPENDING", token: "xoxb-pending", encryptionKey: key,
+  }), true);
+  const pendingWrongAad = encryptSlackToken({ token: "xoxb-pending", teamId: "TOTHER", key });
+  await db.updateTable("slack_oauth_installations").set({ bot_token_ciphertext: pendingWrongAad })
+    .where("id", "=", pendingSession.id).execute();
+  const pendingValidation = await validateMultitenancy({ db, encryptionKey: key });
+  assert.ok(pendingValidation.issues.some((issue) => issue.includes(pendingSession.id) && issue.includes("team-bound AAD")));
+  assert.ok(!JSON.stringify(pendingValidation).includes(pendingWrongAad));
   const portProbe = createServer();
   portProbe.listen(0, "127.0.0.1");
   await once(portProbe, "listening");
@@ -380,6 +399,11 @@ try {
     assert.match(healthy.logs(), /Server listening at/);
     assert.match(healthy.logs(), /SLACK_TOKEN_DECRYPTION_FAILED/);
     assert.match(healthy.logs(), /TADMIN/);
+    assert.match(healthy.logs(), /SLACK_PENDING_TOKEN_DECRYPTION_FAILED/);
+    assert.ok(healthy.logs().includes(pendingSession.id));
+    for (const secret of ["xoxb-pending", pendingWrongAad, pendingSession.state, pendingSession.browserBinding]) {
+      assert.ok(!healthy.logs().includes(secret));
+    }
     assert.ok(!healthy.logs().includes(wrongAad) && !healthy.logs().includes("xoxb-admin"));
     const address = /Server listening at (http:\/\/127\.0\.0\.1:\d+)/.exec(healthy.logs())?.[1];
     assert.ok(address);
@@ -398,6 +422,7 @@ try {
   } finally {
     clearTimeout(timeout);
   }
+  assert.equal(await cancelSlackOAuthInstallation(db, pendingSession.id), true);
   await backfillMultitenancy({
     db,
     providers,
@@ -461,7 +486,7 @@ try {
   assert.equal(provisioned.tenantId, secondTenantId);
   assert.equal(provisioned.selectedChannelId, "CNEW");
   await db.updateTable("slack_workspaces").set({ bot_token_ciphertext: "corrupt" }).where("team_id", "=", "TADMIN").execute();
-  assert.deepEqual(await inspectSlackTokenEncryption(db, key), { keyError: null, invalidWorkspaces: [{ tenantId, teamId: "TADMIN" }] });
+  assert.deepEqual(await inspectSlackTokenEncryption(db, key), { keyError: null, invalidPendingInstallations: [], invalidWorkspaces: [{ tenantId, teamId: "TADMIN" }] });
   await db.updateTable("slack_workspaces").set({ bot_token_ciphertext: workspace.bot_token_ciphertext }).where("team_id", "=", "TADMIN").execute();
   assert.equal(
     await db.selectFrom("team_channel_routes").select("selected_channel_id").where("team_id", "=", "TNEW").executeTakeFirstOrThrow().then((row) => row.selected_channel_id),
@@ -559,6 +584,199 @@ try {
     }
   } finally {
     await provisioningBlocker.end();
+  }
+
+
+  // Pending OAuth provisioning reuses the normal provider checks and pairing
+  // guards, but the exact validated encrypted envelope crosses into active storage.
+  const oauthProviders: AdminProviders = {
+    ...providers,
+    inspectSlackToken: async (token) => {
+      const number = /^xoxb-oauth-(\d+)(?:-reinstall)?$/.exec(token)?.[1];
+      assert.ok(number);
+      return { teamId: `TOAUTH${number}`, botUserId: `UOAUTH${number}`, channelIds: [`COAUTH${number}`] };
+    },
+    inspectInstallationRepository: async (installationId, owner, repo) => ({
+      installationId, githubAccountId: installationId, repositoryId: installationId,
+      repositoryOwnerId: installationId, owner, repo, fullName: `${owner}/${repo}`,
+    }),
+  };
+  const stage = async (number: number, suffix = "") => {
+    const session = await createSlackOAuthSession(db);
+    const claim = await claimSlackOAuthSession(db, session);
+    assert.ok(claim);
+    assert.equal(await stageSlackOAuthInstallation(db, { ...claim, teamId: `TOAUTH${number}`,
+      botUserId: `UOAUTH${number}`, token: `xoxb-oauth-${number}${suffix}`, encryptionKey: key }), true);
+    const pending = await readPendingSlackOAuthInstallation(db, session.id, key);
+    assert.ok(pending);
+    return pending;
+  };
+  const snapshot = async () => ({
+    tenants: await db.selectFrom("tenants").selectAll().orderBy("id").execute(),
+    workspaces: await db.selectFrom("slack_workspaces").selectAll().orderBy("team_id").execute(),
+    installations: await db.selectFrom("github_installations").selectAll().orderBy("installation_id").execute(),
+    routes: await db.selectFrom("team_channel_routes").selectAll().orderBy("team_id").execute(),
+  });
+  const first = await stage(1);
+  const oauthInput = { db, providers: oauthProviders, slackInstallationId: first.id,
+    encryptionKey: key, installationId: "20001", repository: { owner: "OAuth", repo: "One" }, selectedChannelId: "COAUTH1" };
+  const beforeOauth = await snapshot();
+  await assert.rejects(provisionTenant({ ...oauthInput, slackBotToken: first.token }), /exactly one/);
+  await assert.rejects(provisionTenant({ ...oauthInput, slackInstallationId: undefined }), /exactly one/);
+  await assert.rejects(provisionTenant({ ...oauthInput, encryptionKey: Buffer.alloc(32, 8) }), /cannot be decrypted/);
+  const wrongWorkspace = encryptSlackToken({ token: first.token, teamId: "TWRONG", key });
+  await db.updateTable("slack_oauth_installations").set({ bot_token_ciphertext: wrongWorkspace }).where("id", "=", first.id).execute();
+  await assert.rejects(provisionTenant(oauthInput), /cannot be decrypted/);
+  await db.updateTable("slack_oauth_installations").set({ bot_token_ciphertext: first.expectedCiphertext }).where("id", "=", first.id).execute();
+  for (const mismatched of [{ teamId: "TOTHER", botUserId: "UOAUTH1" }, { teamId: "TOAUTH1", botUserId: "UOTHER" }]) {
+    await assert.rejects(provisionTenant({ ...oauthInput, providers: { ...oauthProviders,
+      inspectSlackToken: async () => ({ ...mismatched, channelIds: ["COAUTH1"] }) } }), /live Slack workspace and bot/);
+  }
+  for (const provider of ["inspectSlackToken", "inspectInstallationRepository"] as const) {
+    await assert.rejects(provisionTenant({ ...oauthInput, providers: { ...oauthProviders,
+      [provider]: async () => { throw new Error(`Untrusted provider body: ${first.token}`); } } }),
+    (error: Error) => { assert.match(error.message, /provider validation failed/); assert.ok(!error.message.includes(first.token)); return true; });
+  }
+  assert.deepEqual(await snapshot(), beforeOauth);
+  assert.equal((await getSlackOAuthInstallationStatus(db, first.id))?.status, "pending");
+
+  // A new envelope written after validation invalidates this provisioning attempt,
+  // even when it decrypts to the same token. The previous tenant state rolls back.
+  const changedEnvelope = encryptSlackToken({ token: first.token, teamId: first.teamId, key });
+  await assert.rejects(provisionTenant({ ...oauthInput, providers: { ...oauthProviders,
+    inspectSlackToken: async (token) => {
+      await db.updateTable("slack_oauth_installations").set({ bot_token_ciphertext: changedEnvelope }).where("id", "=", first.id).execute();
+      return oauthProviders.inspectSlackToken(token);
+    } } }), /unavailable/);
+  assert.deepEqual(await snapshot(), beforeOauth);
+  assert.equal((await readPendingSlackOAuthInstallation(db, first.id, key))?.expectedCiphertext, changedEnvelope);
+  const firstResult = await provisionTenant(oauthInput);
+  const firstActive = await db.selectFrom("slack_workspaces").selectAll().where("team_id", "=", first.teamId).executeTakeFirstOrThrow();
+  assert.equal(firstActive.bot_token_ciphertext, changedEnvelope);
+  assert.equal((await getSlackOAuthInstallationStatus(db, first.id))?.consumedTenantId, firstResult.tenantId);
+  assert.equal((await getSlackOAuthInstallationStatus(db, first.id))?.consumedGitHubInstallationId, "20001");
+  assert.equal((await getSlackOAuthInstallationStatus(db, first.id))?.expiresAt, null);
+  assert.equal(await readPendingSlackOAuthInstallation(db, first.id, key), null);
+  await assert.rejects(provisionTenant(oauthInput), /unavailable/);
+
+  const reinstall = await stage(1, "-reinstall");
+  assert.deepEqual(await db.selectFrom("slack_workspaces").selectAll().where("team_id", "=", first.teamId).executeTakeFirstOrThrow(), firstActive);
+  const reinstallInput = { ...oauthInput, slackInstallationId: reinstall.id };
+  const beforeReinstall = await snapshot();
+  await sql`create function fail_oauth_consumption() returns trigger language plpgsql as $$
+    begin if new.status = 'consumed' then raise exception 'Simulated consumption failure'; end if; return new; end $$;
+    create trigger fail_oauth_consumption before update on slack_oauth_installations
+    for each row execute function fail_oauth_consumption();`.execute(db);
+  try {
+    await assert.rejects(provisionTenant(reinstallInput), /Simulated consumption failure/);
+    assert.deepEqual(await snapshot(), beforeReinstall);
+    assert.equal((await readPendingSlackOAuthInstallation(db, reinstall.id, key))?.expectedCiphertext, reinstall.expectedCiphertext);
+  } finally {
+    await sql`drop trigger fail_oauth_consumption on slack_oauth_installations; drop function fail_oauth_consumption();`.execute(db);
+  }
+  assert.equal((await provisionTenant(reinstallInput)).tenantId, firstResult.tenantId);
+  assert.equal((await db.selectFrom("slack_workspaces").select("bot_token_ciphertext").where("team_id", "=", first.teamId).executeTakeFirstOrThrow()).bot_token_ciphertext, reinstall.expectedCiphertext);
+
+  const second = await stage(2);
+  const secondInput = { ...oauthInput, slackInstallationId: second.id, installationId: "20002", selectedChannelId: "COAUTH2" };
+  const secondResults = await Promise.allSettled([provisionTenant(secondInput), provisionTenant(secondInput)]);
+  assert.equal(secondResults.filter((result) => result.status === "fulfilled").length, 1);
+  assert.match(String(secondResults.find((result) => result.status === "rejected")?.reason), /unavailable/);
+  const third = await stage(3);
+  const beforeCancel = await snapshot();
+  await assert.rejects(provisionTenant({ ...oauthInput, slackInstallationId: third.id, installationId: "20003", selectedChannelId: "COAUTH3",
+    providers: { ...oauthProviders, inspectSlackToken: async (token) => {
+      assert.equal(await cancelSlackOAuthInstallation(db, third.id), true);
+      return oauthProviders.inspectSlackToken(token);
+    } } }), /unavailable/);
+  assert.deepEqual(await snapshot(), beforeCancel);
+  assert.equal((await getSlackOAuthInstallationStatus(db, third.id))?.status, "cancelled");
+  const thirdRetry = await stage(3);
+  await provisionTenant({ ...oauthInput, slackInstallationId: thirdRetry.id, installationId: "20003", selectedChannelId: "COAUTH3" });
+  assert.equal((await validateMultitenancy({ db, encryptionKey: key })).ok, true);
+
+  // Exercise the actual compiled command without provider network or shared dist.
+  // The preload supplies only fake fetch responses; CLI parsing, env validation,
+  // provider clients, crypto and PostgreSQL transactions run unchanged.
+  const compiledDirectory = await mkdtemp(fileURLToPath(new URL("../.admin-selftest-", import.meta.url)));
+  try {
+    await build({ entry: [fileURLToPath(new URL("../src/admin.ts", import.meta.url))], outDir: compiledDirectory,
+      format: ["esm"], platform: "node", target: "node24", config: false, silent: true, noExternal: ["@feature-rec/core"] });
+    const preload = join(compiledDirectory, "providers.mjs");
+    await writeFile(preload, `globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input));
+      const reply = (body) => new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
+      if (url.origin === "https://slack.com") {
+        if (new Headers(init?.headers).get("authorization") !== "Bearer " + process.env.CLI_TEST_TOKEN) throw new Error("Unexpected test credential");
+        if (process.env.CLI_TEST_PROVIDER_FAILURE) return reply({ ok: false, error: "invalid_auth", response_metadata: { messages: [process.env.CLI_TEST_TOKEN] } });
+        if (url.pathname === "/api/auth.test") return reply({ ok: true, team_id: process.env.CLI_TEST_TEAM, user_id: process.env.CLI_TEST_BOT });
+        if (url.pathname === "/api/users.conversations") return reply({ ok: true, channels: [{ id: "CCLI" }] });
+      }
+      if (url.origin === "https://api.github.com") {
+        if (url.pathname.endsWith("/access_tokens")) return reply({ token: "fake-github-access-token" });
+        if (url.pathname === "/app/installations/21001" || url.pathname === "/repos/Cli/Repo/installation") return reply({ id: 21001, account: { id: 21001 } });
+        if (url.pathname === "/repos/Cli/Repo") return reply({ id: 21001, name: "Repo", full_name: "Cli/Repo", owner: { id: 21001, login: "Cli" } });
+      }
+      throw new Error("Unexpected provider request in admin CLI test");
+    };`);
+    const rsaKey = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    const cliEnv: NodeJS.ProcessEnv = { ...process.env, DATABASE_URL: testUrl, RAILWAY_ENVIRONMENT_NAME: "selftest",
+      FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY: key.toString("base64"), GITHUB_OIDC_ISSUER: "https://token.actions.githubusercontent.com",
+      GITHUB_APP_ID: "1", GITHUB_PRIVATE_KEY: rsaKey, SLACK_APP_ID: "", SLACK_CLIENT_ID: "", SLACK_CLIENT_SECRET: "",
+      CLI_TEST_TOKEN: "xoxb-oauth-4", CLI_TEST_TEAM: "TOAUTH4", CLI_TEST_BOT: "UOAUTH4" };
+    const cli = (args: string[], extraEnv: NodeJS.ProcessEnv = {}, manualToken?: string) => new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+      const child = execFile(process.execPath, ["--import", preload, join(compiledDirectory, "admin.js"), ...args],
+        { env: { ...cliEnv, ...extraEnv }, timeout: 10_000 }, (error, stdout, stderr) => {
+          if (error) reject(Object.assign(error, { stdout, stderr })); else resolve({ stdout, stderr });
+        });
+      child.stdin!.end(manualToken === undefined ? undefined : `${manualToken}\n`);
+    });
+    const fourth = await stage(4);
+    const provisionArgs = ["provision-tenant", "--environment", "selftest", "--confirm", "--installation-id", "21001", "--repository", "Cli/Repo", "--selected-channel-id", "CCLI", "--slack-installation-id", fourth.id];
+    await assert.rejects(cli(provisionArgs.filter((arg) => arg !== "--confirm")), /requires --confirm/);
+    await assert.rejects(cli(provisionArgs, { RAILWAY_ENVIRONMENT_NAME: "production" }), /does not match/);
+    await assert.rejects(cli(provisionArgs, { CLI_TEST_PROVIDER_FAILURE: "1" }), (error: Error & { stdout: string; stderr: string }) => {
+      assert.match(error.stderr, /provider validation failed/);
+      assert.ok(!error.stderr.includes(fourth.token));
+      assert.ok(!error.stdout.includes(fourth.expectedCiphertext));
+      return true;
+    });
+    const activatedCli = await cli(provisionArgs);
+    assert.equal(activatedCli.stderr, "");
+    const activatedReceipt = JSON.parse(activatedCli.stdout);
+    assert.equal(activatedReceipt.slackTeamId, fourth.teamId);
+    assert.equal((await db.selectFrom("slack_workspaces").select("bot_token_ciphertext").where("team_id", "=", fourth.teamId).executeTakeFirstOrThrow()).bot_token_ciphertext, fourth.expectedCiphertext);
+    const brokenConfig = { FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY: "invalid", GITHUB_OIDC_ISSUER: "invalid", SLACK_APP_ID: "partial" };
+    const stateBeforeRead = await db.selectFrom("slack_oauth_installations").selectAll().where("id", "=", fourth.id).executeTakeFirstOrThrow();
+    const statusCli = await cli(["slack-installation-status", "--environment", "selftest", "--slack-installation-id", fourth.id], brokenConfig);
+    const receiptCli = JSON.parse(statusCli.stdout).installation;
+    assert.equal(receiptCli.status, "consumed");
+    assert.equal(receiptCli.consumedTenantId, activatedReceipt.tenantId);
+    assert.equal(receiptCli.consumedGitHubInstallationId, "21001");
+    assert.equal(receiptCli.expiresAt, null);
+    assert.deepEqual(await db.selectFrom("slack_oauth_installations").selectAll().where("id", "=", fourth.id).executeTakeFirstOrThrow(), stateBeforeRead);
+    for (const secret of [fourth.token, fourth.expectedCiphertext, "fake-github-access-token", "state_hash", "browser_binding_hash", "claim_id"]) {
+      assert.ok(!`${statusCli.stdout}${activatedCli.stdout}`.includes(secret));
+    }
+    await assert.rejects(cli(provisionArgs), /unavailable/);
+    const pendingCancel = await stage(5);
+    const cancelArgs = ["cancel-slack-installation", "--environment", "selftest", "--slack-installation-id", pendingCancel.id];
+    await assert.rejects(cli(cancelArgs, brokenConfig), /requires --confirm/);
+    assert.equal((await getSlackOAuthInstallationStatus(db, pendingCancel.id))?.status, "pending");
+    const cancelCli = JSON.parse((await cli([...cancelArgs, "--confirm"], brokenConfig)).stdout);
+    assert.equal(cancelCli.cancelled, true);
+    assert.equal(cancelCli.installation.status, "cancelled");
+    assert.equal(await readPendingSlackOAuthInstallation(db, pendingCancel.id, key), null);
+    assert.equal(JSON.parse((await cli([...cancelArgs, "--confirm"], brokenConfig)).stdout).cancelled, false);
+    await assert.rejects(cli(["slack-installation-status", "--environment", "selftest", "--slack-installation-id", "invalid"], brokenConfig), /must be a UUID/);
+    await assert.rejects(cli(["slack-installation-status", "--slack-installation-id", fourth.id], brokenConfig), /--environment is required/);
+    const manualCli = await cli(provisionArgs.slice(0, -2), {}, fourth.token);
+    assert.equal(JSON.parse(manualCli.stdout).tenantId, activatedReceipt.tenantId);
+    const manualEnvelope = (await db.selectFrom("slack_workspaces").select("bot_token_ciphertext").where("team_id", "=", fourth.teamId).executeTakeFirstOrThrow()).bot_token_ciphertext;
+    assert.notEqual(manualEnvelope, fourth.expectedCiphertext);
+    assert.equal(decryptSlackToken({ envelope: manualEnvelope, teamId: fourth.teamId, key }), fourth.token);
+  } finally {
+    await rm(compiledDirectory, { recursive: true, force: true });
   }
 
   console.log("service admin selftest passed");

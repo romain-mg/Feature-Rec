@@ -8,6 +8,7 @@ import type { DB } from "./storage/schema";
 import { lockTeamChannelRoute, lockTenantProvisioning } from "./storage/locks";
 import { ensureSlackTokenKey, inspectSlackTokenEncryption } from "./storage/slack-token-check";
 import { writeSelectedChannel } from "./storage/channel-routing";
+import { consumeSlackOAuthInstallation, readPendingSlackOAuthInstallation } from "./storage/slack-oauth";
 
 type Database = Kysely<DB> | Transaction<DB>;
 
@@ -219,6 +220,10 @@ export async function validateMultitenancy(input: {
   if (tokenCheck.keyError) issues.push(tokenCheck.keyError);
   for (const workspace of tokenCheck.invalidWorkspaces) {
     issues.push(`Slack token ciphertext for ${workspace.teamId} cannot be decrypted with team-bound AAD`);
+  }
+
+  for (const installation of tokenCheck.invalidPendingInstallations) {
+    issues.push(`Pending Slack token ciphertext for ${installation.id} cannot be decrypted with team-bound AAD`);
   }
 
   return {
@@ -525,7 +530,8 @@ export type ProvisionReport = {
 export async function provisionTenant(input: {
   db: Kysely<DB>;
   providers: AdminProviders;
-  slackBotToken: string;
+  slackBotToken?: string;
+  slackInstallationId?: string;
   encryptionKey: Buffer;
   installationId: string;
   repository: { owner: string; repo: string };
@@ -533,25 +539,43 @@ export async function provisionTenant(input: {
   selectedChannelId?: string;
   replacePairing?: boolean;
 }): Promise<ProvisionReport> {
-  if (!input.slackBotToken) throw new Error("Slack bot token must not be empty");
+  if ((input.slackBotToken !== undefined) === (input.slackInstallationId !== undefined)) {
+    throw new Error("Choose exactly one Slack bot token or pending installation ID");
+  }
+  const pending = input.slackInstallationId === undefined ? null : await readPendingSlackOAuthInstallation(
+    input.db, uuid(input.slackInstallationId, "Slack installation ID"), input.encryptionKey,
+  );
+  if (input.slackInstallationId !== undefined && !pending) throw new Error("Pending Slack installation is unavailable");
+  const token = pending?.token ?? input.slackBotToken;
+  if (!token) throw new Error("Slack bot token must not be empty");
   if (input.selectedChannelId !== undefined && !input.selectedChannelId.trim()) {
     throw new Error("Selected channel ID must not be empty");
   }
   positiveDecimal(input.installationId, "GitHub installation ID");
   const [slack, repository] = await Promise.all([
-    input.providers.inspectSlackToken(input.slackBotToken),
+    input.providers.inspectSlackToken(token),
     input.providers.inspectInstallationRepository(
       input.installationId,
       input.repository.owner,
       input.repository.repo,
     ),
-  ]);
+  ]).catch((error: unknown) => {
+    // Provider failures can quote response bodies or credentials. Pending tokens
+    // must remain internal even when validation fails before the transaction.
+    if (pending) throw new Error("Pending Slack installation provider validation failed; check provider access and retry");
+    throw error;
+  });
+  if (pending && (slack.teamId !== pending.teamId || slack.botUserId !== pending.botUserId)) {
+    throw new Error("Pending Slack installation does not match the live Slack workspace and bot");
+  }
   if (input.selectedChannelId !== undefined && !slack.channelIds.includes(input.selectedChannelId)) {
     throw new Error("The Slack bot is not a member of the selected channel");
   }
 
-  const ciphertext = encryptSlackToken({
-    token: input.slackBotToken,
+  // The exact envelope was decrypted and provider-validated above. Both storage
+  // locations use the same key and workspace AAD, so transferring it needs no IV.
+  const ciphertext = pending?.expectedCiphertext ?? encryptSlackToken({
+    token,
     teamId: slack.teamId,
     key: input.encryptionKey,
   });
@@ -672,6 +696,12 @@ export async function provisionTenant(input: {
       )
       .execute();
     await trx.updateTable("tenants").set({ enabled: true }).where("id", "=", tenantId).execute();
+    if (pending) {
+      await consumeSlackOAuthInstallation(trx, {
+        id: pending.id, expectedCiphertext: ciphertext, tenantId,
+        githubInstallationId: repository.installationId, encryptionKey: input.encryptionKey,
+      });
+    }
     return {
       tenantId,
       slackTeamId: slack.teamId,

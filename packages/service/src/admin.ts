@@ -16,6 +16,8 @@ import { migrationProvider } from "./storage/migrations";
 import type { DB } from "./storage/schema";
 import { parseArgs, readSecret, type ParsedArgs } from "./admin-input";
 import { withMigrationLock } from "./storage/locks";
+import { cancelSlackOAuthInstallation, getSlackOAuthInstallationStatus } from "./storage/slack-oauth";
+import { z } from "zod";
 
 const HELP = `Feature-Rec production administration
 
@@ -29,8 +31,10 @@ Usage:
     [--tenant-id <uuid>] [--rebuild-cycle-keys --traffic-paused]
   node dist/admin.js provision-tenant --environment <name> --confirm
     --installation-id <id> --repository <owner/repo> [--tenant-id <uuid>]
-    [--selected-channel-id <id>] [--replace-pairing]
-    (reads the Slack bot token from a non-echoing TTY prompt or stdin)
+    [--selected-channel-id <id>] [--replace-pairing] [--slack-installation-id <uuid>]
+    (without --slack-installation-id, reads the Slack bot token from a non-echoing TTY prompt or stdin)
+  node dist/admin.js slack-installation-status --environment <name> --slack-installation-id <uuid>
+  node dist/admin.js cancel-slack-installation --environment <name> --confirm --slack-installation-id <uuid>
   node dist/admin.js prepare-rollback-to-a --environment <name> (--dry-run | --apply --confirm)
     [--traffic-paused]
 
@@ -184,6 +188,21 @@ async function main(): Promise<void> {
       return;
     }
 
+    if (args.command === "slack-installation-status" || args.command === "cancel-slack-installation") {
+      const id = requireFlag(args, "slack-installation-id");
+      if (!z.string().uuid().safeParse(id).success) throw new Error("--slack-installation-id must be a UUID");
+      if (args.command === "cancel-slack-installation") {
+        requireConfirmation(args);
+        const cancelled = await cancelSlackOAuthInstallation(db, id);
+        print(environment, { cancelled, installation: await getSlackOAuthInstallationStatus(db, id) });
+      } else {
+        const installation = await getSlackOAuthInstallationStatus(db, id);
+        print(environment, { installation });
+        if (!installation) process.exitCode = 1;
+      }
+      return;
+    }
+
     // Administrative provider calls do not authenticate runners or serve a public URL.
     const env = readEnv({ ...process.env, FEATURE_REC_BASE_URL: "https://admin.invalid" });
     if (args.command === "validate-contract-readiness") {
@@ -219,11 +238,13 @@ async function main(): Promise<void> {
       const encryptionKey = requireEncryptionKey(env);
       const installationId = requireFlag(args, "installation-id");
       const repository = parseRepository(requireFlag(args, "repository"));
-      const token = await readSecret();
+      const slackInstallationId = flag(args, "slack-installation-id");
+      const token = slackInstallationId === undefined ? await readSecret() : undefined;
       const report = await provisionTenant({
         db,
         providers: providers(env),
         slackBotToken: token,
+        slackInstallationId,
         encryptionKey,
         installationId,
         repository,
