@@ -17,10 +17,29 @@ it before decrypting or calling Slack. `slack_workspaces.selected_channel_id` ow
 legacy route dual writes, but does not read legacy rows as runtime authority. Lifecycle deletion
 explicitly removes team settings and disables the tenant even before the later cascade migration.
 
-The A/B/C/D release boundaries remain separate: expand, cut over, enforce/stop legacy writes, then
-contract. B registers no migration beyond `0008`. Later schema rollback must run the newer artifact's
-targeted down migration before starting the older artifact. B-to-A is limited to a validated
-singleton or a pre-cutover restore. See the [cutover and rollback runbook](setup-and-operations.md#oidc-cutover-checklist).
+The release boundaries remain separate: A expands, B cuts over, B2 adds Slack OAuth installation,
+C enforces/stops legacy writes, and D contracts. The retained B artifact stops at `0008`; this B2
+checkout registers additive `0009_slack_oauth_installations` and retains all B compatibility behavior.
+C's enforcement must become `0010` and D's contract `0011` when the separate unshipped work is
+integrated; this step does not rename that branch or establish production's migration state.
+
+B2 provides hosted Slack OAuth routes, SDK configuration and
+[persistent OAuth storage](setup-and-operations.md#persistent-installation-storage). Session secrets
+are hashed, callback claims are single-use across processes, and verified pending bot tokens are
+encrypted separately from active workspace credentials. Pending installations cannot authorize
+runtime work or replace an active token. Consumption requires a transaction with enabled matching
+integrations and the exact validated active/pending ciphertext, records the result identifiers and clears the pending
+ciphertext. Operator commands provision by pending installation ID, inspect sanitized
+status, and cancel abandoned records. Manual token input remains supported. Pending
+records have no local expiry; OAuth sessions expire after ten minutes. Live hosted
+verification in two real workspaces remains a release gate.
+
+Later schema rollback must run the newer artifact's targeted down migration before starting the
+older artifact. B2-to-B drops only temporary OAuth storage after all unconsumed records have been
+cancelled (or, for OAuth sessions, expired through cleanup), preserving active tenants/integrations and the key verifier.
+C-to-B2 preserves OAuth storage. B-to-A remains limited to a validated singleton or a pre-cutover
+restore, after B2-to-B if needed. See the
+[migration and rollback runbook](setup-and-operations.md#backup-rollback-and-migration).
 
 ## Historical singleton notes
 

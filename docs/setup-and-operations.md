@@ -33,8 +33,8 @@ action input to their own public origin.
 
 Every backend call uses a fresh GitHub Actions OIDC token. Verified repository owner and repository
 IDs select the enabled tenant and a repository-scoped GitHub App token. A shared runner secret and
-caller-provided repository names cannot authorize requests. The invite-only OAuth onboarding page
-is a separate requirement before external beta launch.
+caller-provided repository names cannot authorize requests. Hosted Slack OAuth installation is implemented
+in B2; see its [current implementation boundary](#hosted-slack-oauth-installation-b2).
 
 The development example currently retains `@main`; no Feature-Rec runner workflow is active yet.
 The pre-cutover pinning step applies when active consumers exist. The retired runner secret is absent
@@ -317,7 +317,7 @@ The runtime contract is:
 | `GITHUB_PRIVATE_KEY` | Required for GitHub operations | GitHub App signing key |
 | `SLACK_SIGNING_SECRET` | Required for Slack review | Slack interaction, event, and command verification |
 | `SLACK_APP_ID`, `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET` | Optional as a complete group | Hosted Slack OAuth configuration; distinct from the signing secret |
-| `FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY` | Required when workspace rows exist | Exactly 32 random bytes encoded as base64; encrypts each workspace's stored bot token |
+| `FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY` | Required when a key verifier, workspace token or pending token is stored | Exactly 32 random bytes encoded as base64; encrypts stored workspace and pending bot tokens |
 | `GITHUB_OIDC_ISSUER` | Optional | Trusted HTTPS issuer; defaults to `https://token.actions.githubusercontent.com` |
 
 Configuration is injected at runtime. Do not put secrets in the Dockerfile or image. The backend
@@ -331,32 +331,100 @@ with no independent audience override. Discovery/JWKS access is lazy until the f
 so a fresh-database `/health` smoke does not call GitHub or Slack. No runtime path accepts
 `FEATURE_REC_RUNNER_TOKEN`, `SLACK_BOT_TOKEN`, `FEATURE_REC_GITHUB_TOKEN`, or a `GITHUB_TOKEN` fallback.
 
-### Slack OAuth preparation (B2 milestone 1)
+### Hosted Slack OAuth installation (B2)
 
-The service validates optional OAuth configuration and includes an `@slack/oauth`
-installer factory. Public installation routes and persistent pending installations
-are implemented in later B2 milestones; configuring credentials alone does not
-make installation available. Existing Slack reviews and manual tenant provisioning
-continue to work.
+This checkout implements the public start/callback routes, encrypted pending
+storage, and operator provisioning/status/cancellation commands. Real hosted
+installation in two workspaces remains a release gate; local tests do not prove
+that the Slack app or deployment is configured.
 
-Leave all three OAuth variables absent or empty to disable configuration. Otherwise,
-provide all three: an app ID beginning with `A`, the numeric `SLACK_CLIENT_ID` pair
-separated by a dot, and a nonempty client secret without whitespace. Partial or
-malformed configuration fails startup with a diagnostic that omits supplied values.
-Startup and `/health` make no Slack request, including when OAuth is configured.
+Leave all three OAuth variables absent or empty to disable the routes. Otherwise,
+provide `SLACK_APP_ID`, `SLACK_CLIENT_ID`, and `SLACK_CLIENT_SECRET` together.
+Partial/malformed configuration fails startup without echoing values. Configure
+`FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY` before accepting installations; without
+it the installation endpoints return 503. Startup and `/health` need no Slack call.
 
-Register the normalized `FEATURE_REC_BASE_URL` plus `/api/slack/oauth/callback` in
-the Slack app's OAuth redirect URLs; there is no independent redirect override.
-Use HTTPS for the hosted backend, enable unlisted distribution for additional
-workspaces, keep token rotation disabled, and retain the existing stable token
-encryption key for pending-token storage in the next milestones.
+Register `FEATURE_REC_BASE_URL` plus `/api/slack/oauth/callback` in the Slack app's
+OAuth redirect URLs. Use HTTPS, enable unlisted distribution for other workspaces,
+keep token rotation disabled and retain the existing encryption key. Required bot
+scopes are `chat:write`, `files:write`, `usergroups:read`, `channels:read`,
+`groups:read`, and `commands`. Existing events/interactivity/command URLs and the
+app signing secret continue to handle runtime Slack requests independently.
 
-The prepared installer uses OAuth v2, direct redirects, state and browser-cookie
-verification, and requires explicit state/installation stores. It has a ten-second
-network timeout and disables both ordinary and rate-limit retries. Its logger
-discards raw SDK arguments and emits only fixed warning/error categories. HTTP query
-redaction, cookie integration, and sanitized callback responses arrive with the
-routes; the factory must not be exposed without those protections.
+1. Open the fixed `<backend>/api/slack/oauth/start` URL in a browser. The SDK
+   redirects directly to Slack. There is no invite, app login or extra landing page.
+2. Select the intended workspace and approve. The callback checks independent
+   browser binding before the SDK claims the single-use database session. It
+   exchanges once, validates the normalized app/team/bot/scopes/token model and
+   cross-checks live Slack identity before encrypting a pending token.
+3. The completion response shows only the opaque installation ID and verified
+   workspace ID. Hand these to the operator. Nothing is activated yet.
+4. Confirm the workspace, invite its bot to the intended channel, and provision
+   it with `--slack-installation-id` as shown below. Pending installations have no
+   local expiry; explicitly cancel abandoned ones. Provisioning revalidates Slack
+   access, so removal/revocation at Slack still prevents activation.
+
+Cookies use Secure/HttpOnly/SameSite=Lax with a ten-minute lifetime. Callbacks clear
+both cookies. The SDK supports one current attempt per browser cookie context;
+a second tab or failed callback can require a fresh start. An interrupted exchange
+cannot be replayed. SDK network requests have a ten-second timeout with no ordinary
+or rate-limit retries; the independent identity check has a five-second timeout.
+Responses use no-store/no-referrer and contain no third-party content. Automatic
+request logs omit query strings, and OAuth diagnostics emit fixed safe categories.
+
+Each service process permits at most 30 starts and 120 callbacks per minute;
+excess requests return 429 with Retry-After. These are deployment-wide per-process
+budgets, independent of untrusted forwarded IP headers; multiple replicas each
+have their own budget. Limited start requests create no session or replacement
+cookie. Session cleanup runs once per minute, at most 100 records per batch,
+without overlapping sweeps. Closing the server stops the timer and awaits a sweep.
+
+#### Persistent installation storage
+
+Migration [`0009_slack_oauth_installations`](../packages/service/src/storage/migrations/0009_slack_oauth_installations.ts)
+adds one temporary table. The [storage operations](../packages/service/src/storage/slack-oauth.ts)
+create opaque installation IDs, store only SHA-256 hashes of independent random
+state and browser-binding secrets, and give a new session ten minutes to complete
+its exchange. A matching, unexpired session can be claimed once across processes;
+claiming moves it from `awaiting_callback` to `exchanging`. A claimed exchange
+cannot be reclaimed after a crash; the user must start a fresh authorization.
+
+Staging stores a verified workspace/bot identity and an encrypted pending token,
+clears session secrets, changes the status to `pending`, and clears `expires_at`.
+Pending installations have no local expiry; they remain until activation or cancellation. The caller must validate the Slack installation before
+staging it. Encryption uses the existing stable key with the workspace ID as
+authenticated data. Staging a reinstall does not modify the active workspace
+credential, and runtime Slack handlers never read pending tokens. In the same
+transaction, staging checks/pins the key before writing ciphertext and rechecks
+expiry before the write. If it expires or the write fails, rollback also removes
+any verifier inserted by that attempt. A missing verifier can be bootstrapped only
+when no active workspace or pending ciphertext exists; no pending row is exempted.
+
+The internal consumption operation requires the same database transaction as
+validated integration writes and tenant activation. It verifies the enabled
+tenant, matching Slack workspace/bot and GitHub installation, and equality of the
+exact validated, active and pending encrypted envelopes. It then records `consumed` with the resulting
+tenant/GitHub installation IDs and clears the staged ciphertext. The caller must
+let consumption errors abort that transaction. Session expiry is checked after
+acquiring locks during claim and staging. Consumption checks availability and
+pairing under lock, including cancellation or consumption by another caller.
+Pending-ID provisioning copies the validated envelope unchanged into active storage.
+Manual-token provisioning still encrypts raw input; see the
+[B2 design](plans/feature-rec-oidc-multitenancy-plan.md#pr-b2--hosted-slack-oauth-installation).
+
+The status operation returns only the installation ID, verified identity, dates,
+lifecycle status and consumed result IDs. Pending records report no expiry. It
+reports an elapsed OAuth session as `expired` even before cleanup. Cancellation changes an unconsumed record
+to `cancelled` and clears its secrets and ciphertext. Status and cancellation are operator-only commands, not public HTTP endpoints.
+
+Cleanup handles at most 100 records per call by default, with an explicit batch
+limit of 1–1,000. It uses `FOR UPDATE SKIP LOCKED` so concurrent callers skip busy
+records. Pending installations are never aged out. Expired OAuth sessions have
+their secrets cleared; cancellation and consumption clear pending ciphertext. Terminal
+records become eligible for deletion 24 hours after expiry/cancellation, or 24 hours
+after consumption for a consumed receipt. Deletion requires a cleanup call and is
+bounded by its batch size. The configured OAuth server schedules these sweeps;
+pending installations are retained until explicit consumption or cancellation.
 
 ## Railway Deployment
 
@@ -403,9 +471,11 @@ policy, then perform at least one `pg_dump`/`pg_restore` drill before the state 
 Rollback depends on both the artifact and stored tenant data; automatic down migrations are not used.
 
 Migration `0008_multitenant_expand` adds only nullable/new schema and relaxes the legacy repository
-name columns. Deploys A and B register only through `0008` and retain `team_channel_routes`.
-Deploy B reads the workspace selection and dual-writes the legacy route. Its `down()` refuses to proceed
-if any cycle lacks the legacy `owner`/`repo` values needed by deploy A.
+name columns. The retained A/B artifacts register only through `0008`; B2 registers through the
+additive `0009_slack_oauth_installations` and retains all B compatibility behavior, including
+`team_channel_routes` and its dual writes. B/B2 read the workspace selection as routing authority.
+The `0008` down migration refuses to proceed if any cycle lacks the legacy `owner`/`repo` values
+needed by deploy A. Check the deployed migration status before choosing a rollback target.
 
 The image includes the compiled `node dist/admin.js` control plane; it does not depend on `tsx` or
 development dependencies. Production commands require an explicit `--environment` label, and every
@@ -424,18 +494,70 @@ legacy repository through the GitHub App, detects future cycle-key collisions, w
 tenant transactionally, and enables it only after validation. Run this reconciliation with the
 retained deploy-A artifact before cutover; additional tenants are supported after deploy B is serving.
 
-The first successful backfill/provisioning transaction stores an independent HMAC-SHA256 key verifier
-in the singleton `slack_token_encryption_key` table; subsequent writes and startup must match it.
-Startup decrypt-checks stored tokens after checking that verifier. A wrong/missing key or missing
-verifier prevents startup; one corrupt token produces an error with the tenant/workspace IDs and
-event `SLACK_TOKEN_DECRYPTION_FAILED`, without blocking other tenants. Investigate that alert and
-repair/re-provision the affected credentials; readiness validation continues to fail until repaired.
-Neither tokens nor ciphertexts are logged. Back up the verifier with the database and the key
-separately. Never delete the verifier to bypass a key mismatch; restore the matching backup/key.
+The first successful backfill, provisioning or pending-token staging transaction stores an
+independent HMAC-SHA256 key verifier in the singleton `slack_token_encryption_key` table;
+subsequent token writes and startup must match it. Pending tokens pin the key even when no tenant
+exists yet. If credentials exist but their verifier is missing, writes fail instead of establishing
+a replacement verifier.
+
+Startup decrypt-checks active and pending tokens after checking that verifier. A wrong/missing key
+or missing verifier prevents startup. A corrupt active token produces event
+`SLACK_TOKEN_DECRYPTION_FAILED` with tenant/workspace IDs; a corrupt pending token produces
+`SLACK_PENDING_TOKEN_DECRYPTION_FAILED` with installation/workspace IDs. These individual failures
+allow startup for other tenants but appear as readiness-validation issues. Repair/re-provision the
+affected active credentials, or cancel an unusable pending installation with
+`cancel-slack-installation` and start a fresh authorization through the hosted start URL. Neither tokens nor ciphertexts are logged. Back up
+the verifier with the database and the key separately. Never delete the verifier to bypass a key
+mismatch; restore the matching backup/key.
 
 For the final pre-cutover reconciliation, pause new workflows and drain active runs, then use
-`backfill-multitenancy --apply --confirm --rebuild-cycle-keys --traffic-paused`. To roll the database
-back to the pre-expansion schema:
+`backfill-multitenancy --apply --confirm --rebuild-cycle-keys --traffic-paused`.
+
+**B2-to-B rollback:**
+
+1. Stop new installations, pause runner/Slack writes, drain in-flight requests, and verify a fresh
+   database backup plus the pinned B artifact. Disable automatic deploys and stop all B2 service
+   instances through the platform controls. A process kill alone is insufficient with auto-restart.
+2. Explicitly cancel unconsumed installations before downgrading. The `0009` guard rejects every
+   `awaiting_callback`, `exchanging` or `pending` row, including expired session rows; cancellation or session cleanup
+   must transition them first. From the maintenance process, identify unconsumed IDs with:
+
+   ```sql
+   SELECT id, status, team_id FROM slack_oauth_installations
+   WHERE status IN ('awaiting_callback', 'exchanging', 'pending');
+   ```
+
+   For each ID, use the compiled operator command:
+
+   ```bash
+   node dist/admin.js cancel-slack-installation --environment production \
+     --slack-installation-id <id> --confirm
+   ```
+
+   Rerun the query and verify it returns no rows before migrating down. A sanitized
+   `expired` status alone does not prove cleanup changed the stored lifecycle; the
+   migration guard checks the stored value. Cancellation also works without the
+   encryption key or provider credentials.
+3. From a separate maintenance process, use B2's compiled admin artifact against the private
+   database, inspect `migration-status`, and run:
+
+   ```bash
+   node dist/admin.js migrate-to 0008_multitenant_expand --environment production \
+     --expect-current 0009_slack_oauth_installations --service-stopped --traffic-paused --confirm
+   ```
+
+   The flags acknowledge actual operator actions; they do not stop the service. The down migration
+   locks the temporary table while checking its lifecycle guard, then drops only that table. Active
+   tenants, Slack workspaces/tokens, GitHub installations and the key verifier remain intact.
+4. Verify migration status before starting only the pinned B image. Check `/health` and an existing
+   review flow, then resume traffic. Do not restart B2, which would reapply `0009`, or restore
+   autodeploys until their target matches the chosen schema.
+
+Kysely rejects a recorded migration absent from an older artifact. Always migrate down using the
+newer artifact before starting the older service; do not hand-edit migration records.
+
+To roll the database back to the pre-expansion schema, first complete B2-to-B if `0009` is applied,
+then use the retained B artifact at `0008`:
 
 1. Pause runner and Slack writes, drain active requests, and verify a fresh database backup and the
    retained older release. Disable automatic deploys and stop all current service instances using
@@ -457,10 +579,15 @@ B-to-A requires no migration down, but is allowed only for a validated singleton
 run `prepare-rollback-to-a --dry-run`, then `--apply --confirm --traffic-paused` with the explicit
 environment, and redeploy the retained A image only after its report passes. Keep the old hosted
 runner/Slack secrets sealed and unused during this observation window. Once a second tenant exists,
-use a B hotfix or restore the pre-cutover backup instead. Deploy C and D are separate future PRs;
-C-to-B must migrate down to `0008` using C's admin artifact before starting B, and D-to-C must migrate
-down to `0009` using D's artifact before starting C. Kysely rejects migrations absent from the older
-artifact, so reversing those steps prevents startup.
+use a B hotfix or restore the pre-cutover backup instead. Complete B2-to-B first if the database
+is at `0009` before following this B-to-A procedure.
+
+Deploy C and D remain separate future PRs. When integrating the unshipped C work with B2, name its
+enforcement migration `0010_multitenant_enforce` and reserve `0011_multitenant_contract` for D.
+C-to-B2 then migrates down to `0009` with C's admin artifact, preserving OAuth storage; D-to-C
+migrates down to `0010` with D's artifact. Returning further to B also requires the B2-to-B procedure
+above. This step does not rename C's separate branch or establish what is applied in production;
+verify the deployed version before integrating that sequence. Never renumber an applied migration.
 
 ### OIDC cutover checklist
 
@@ -478,7 +605,8 @@ the retained A backfill with `--rebuild-cycle-keys --traffic-paused`. Require a 
 request handling. Switch the inventoried workflows to their pinned OIDC revision, provision the
 second test tenant, run the two-tenant smoke below, and resume traffic. During observation, compare
 legacy/new selected-channel values, rerun readiness validation, and inspect tenant-scoped decrypt,
-OIDC/JWKS, and installation-authorization failures. Keep migrations `0009` and `0010` out of B.
+OIDC/JWKS, and installation-authorization failures. The original B artifact stops at `0008`;
+B2 adds only OAuth storage `0009`. Keep C/D enforcement and contract migrations out of B/B2.
 
 ### Provision a tenant
 
@@ -504,8 +632,26 @@ Provide the Slack bot token via the non-echoing prompt or stdin. The command val
 bot channel membership, and the GitHub installation's scoped repository grant before writing the
 encrypted token and enabling the tenant. To replace a token or reinstall the same customer's
 integrations, supply its existing `--tenant-id`; identities are checked before replacement.
-Never pass tokens as command-line arguments. The temporary operator flow will be reused by the
-separate invite-only onboarding page before beta launch.
+Never pass tokens as command-line arguments. For a hosted OAuth installation,
+replace manual token input with its pending installation ID:
+
+```bash
+node --env-file=.env packages/service/dist/admin.js provision-tenant \
+  --environment development --confirm --slack-installation-id <pending-id> \
+  --installation-id <GitHub-installation-id> --repository <owner/repo> \
+  --selected-channel-id <Slack-channel-id>
+node --env-file=.env packages/service/dist/admin.js slack-installation-status \
+  --environment development --slack-installation-id <pending-id>
+node --env-file=.env packages/service/dist/admin.js cancel-slack-installation \
+  --environment development --confirm --slack-installation-id <pending-id>
+```
+
+The pending-ID path does not prompt for or print a token. It copies the exact
+validated ciphertext and consumes the record in the same activation transaction.
+If the response is lost, status exposes consumed tenant/installation identifiers.
+Status and cancellation only need database access, so broken provider credentials
+or an unavailable encryption key do not prevent inspecting/cancelling a record.
+Cancellation clears our staged credential; it does not revoke the token at Slack.
 
 Migration `0006_drop_legacy_bot_channels` permanently removes the obsolete membership snapshot after
 explicit routing has completed its observation window. Before deploying it, verify every expected
@@ -521,8 +667,21 @@ URLs stable across that move.
 
 ## Smoke Checks
 
-Run the [development validation gate](../README.md#validation) first. The following
-checks exercise real integrations in staging.
+Run the [development validation gate](../README.md#validation) first. The production
+image has a separate local test using a uniquely created temporary database:
+
+```bash
+docker build --tag feature-rec-b2:local .
+TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
+  pnpm --filter @feature-rec/service exec tsx scripts/service-image-selftest.mts feature-rec-b2:local
+```
+
+Optionally set `PREVIOUS_SERVICE_IMAGE` to a locally retained B image to verify
+that it rejects schema 0009 and starts only after downgrade to 0008. The harness
+uses only the temporary database for migrations, fixtures and rollback, then
+removes its containers and database. It never loads `.env` or production credentials.
+
+The following checks exercise real integrations in staging.
 
 In a staging Slack workspace, also verify that the first join gets one greeting and later joins are
 silent; switch from a DM and confirm there is one ephemeral reply and no channel-visible post;

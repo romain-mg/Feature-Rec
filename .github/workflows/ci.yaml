@@ -57,33 +57,5 @@ jobs:
       - name: Build service image
         run: docker build --tag feature-rec-service:ci .
 
-      - name: Smoke test compiled admin command
-        run: docker run --rm --entrypoint node feature-rec-service:ci dist/admin.js --help
-
-      - name: Smoke test service image
-        run: |
-          docker run --detach --name feature-rec-service-ci --network host \
-            --env DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
-            --env FEATURE_REC_BASE_URL=https://feature-rec-ci.example \
-            --env FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
-            --env GITHUB_OIDC_ISSUER=https://token.actions.githubusercontent.com \
-            feature-rec-service:ci
-
-          for attempt in {1..30}; do
-            if curl --fail --silent http://127.0.0.1:3000/health; then
-              exit 0
-            fi
-            sleep 1
-          done
-
-          exit 1
-
-      - name: Print service logs on failure
-        if: failure()
-        run: docker logs feature-rec-service-ci || true
-
-      - name: Clean up service image
-        if: always()
-        run: |
-          docker stop --timeout 10 feature-rec-service-ci || true
-          docker rm feature-rec-service-ci || true
+      - name: Smoke test packaged OAuth service and administration
+        run: pnpm --filter @feature-rec/service exec tsx scripts/service-image-selftest.mts feature-rec-service:ci

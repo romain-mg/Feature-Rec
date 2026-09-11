@@ -1,10 +1,10 @@
 # Feature-Rec OIDC and Multitenancy Dev Plan
 
-Status: PR A/B complete and deployed; PR B2 milestone 1 SDK/configuration implemented, hosted installation pending; PR C implemented but release gated on B2 and two-workspace validation; PR D contract pending
+Status: PR A/B complete and deployed; PR B2 milestones 1–6 and local packaging/rollback verified, live hosted verification pending; PR C implemented but release gated on B2 and two-workspace validation; PR D contract pending
 
 Date: 2026-09-03
 
-Last reviewed: 2026-09-04
+Last reviewed: 2026-09-11 (B2 pre-landing review; earlier reviews remain below)
 
 Sequencing amended: 2026-09-08 — add PR B2 before releasing PR C; use
 OAuth endpoints on the existing backend, superseding the local-helper proposal.
@@ -802,6 +802,13 @@ hotfix/roll-forward or restore the pre-cutover backup instead.
 
 ### PR B2 — hosted Slack OAuth installation
 
+**Checkout status (2026-09-10):** milestones 1–6 and the local packaging/rollback
+checks of milestone 7 are implemented and verified. Hosted verification in two
+real workspaces and release observation remain open. See the
+[implementation and verification record](feature-rec-b2-verification.md).
+Pending installations have no local expiry. Historical reviews below may describe
+intermediate implementations; this status and the current runbook take precedence.
+
 Purpose: install the same Slack app in any additional workspace and obtain its
 workspace-specific bot token automatically on the existing backend. After the
 user approves in Slack, the callback exchanges and stores the token without an
@@ -856,7 +863,7 @@ The SDK can omit an isolated malformed raw refresh/expiry field during
 normalization, so B2 does not promise exhaustive validation of Slack's raw response
 envelope. This is an explicit boundary of using the SDK without interception.
 
-Romain selected the SDK on 2026-09-09 after the behavior/guarantee comparison,
+The SDK was selected on 2026-09-09 after the behavior/guarantee comparison,
 superseding the earlier native-HTTP choice. Basis:
 [official SDK documentation](https://docs.slack.dev/tools/node-slack-sdk/oauth/),
 [configuration options](https://docs.slack.dev/tools/node-slack-sdk/reference/oauth/interfaces/InstallProviderOptions/),
@@ -920,7 +927,9 @@ Hosted flow and authorization boundary:
  installations. The normalized-response boundary above applies; B2 does not
  independently parse the raw exchange response.
 6. Encrypt the verified pending bot token in PostgreSQL using the existing
- stable key and verified team ID as AAD. The existing backend serves a minimal
+ stable key and verified team ID as AAD. Pending installations have no local
+ expiry and remain until activation or explicit cancellation; the initial OAuth
+ session still expires after ten minutes. The existing backend serves a minimal
  sanitized completion page stating that the Slack app is installed and Feature-Rec
  activation is pending operator provisioning. Include the opaque pending
  installation ID and verified workspace ID for operator handoff. This completion
@@ -935,22 +944,31 @@ Hosted flow and authorization boundary:
  to the intended channel, then calls existing
  `provision-tenant` with a new `--slack-installation-id` token source plus GitHub
  installation/repository and channel inputs. Fetch/decrypt the pending token
- internally and reuse existing Slack/GitHub validation, encryption, uniqueness
- and re-pairing guards. Only successful provisioning enables the tenant; callback
+ internally and reuse existing Slack/GitHub validation, uniqueness and re-pairing
+ guards. For this pending-ID path, copy the validated encrypted envelope unchanged
+ into `slack_workspaces`: both tables use the same key and verified workspace ID
+ as AES-GCM AAD. Do not re-encrypt that token or generate a new IV for the transfer.
+ Only successful provisioning enables the tenant; callback
  parameters cannot choose tenant IDs, GitHub pairings, channels or replacement
  mode. Keep the existing manual-token input path for compatibility.
  Pending tokens are available only to installation validation and provisioning;
  runtime handlers continue to require an enabled, paired tenant and must not use
  staged credentials to run reviews, change tenant settings or access GitHub.
 8. Consume the pending installation and clear its staged ciphertext in the same
- transaction as final integration writes and tenant activation. Concurrent
+ transaction as final integration writes and tenant activation. Inside that
+ transaction, require both the locked pending envelope and the active workspace
+ envelope to equal the exact envelope decrypted and provider-validated beforehand,
+ in addition to key-verifier and tenant/team/bot/GitHub pairing checks. Check that the locked record is still pending before clearing it.
+ The pending-ID path and exact equality guard are implemented together in
+ milestone 5. Manual-token input remains independent of pending consumption.
+ Manual-token provisioning continues to encrypt raw input. Concurrent
  provisioning attempts must not consume it twice. Validation/transaction failure
- leaves a bounded, retryable pending installation and existing tenants unchanged;
+ leaves a retryable pending installation and existing tenants unchanged;
  a lost success response is recoverable by inspecting the sanitized record status.
  Reinstallation must not replace an active tenant's token before its explicit
  provisioning validation succeeds.
  Keep environment/confirmation checks on provisioning writes. Provide read-only
- admin inspection of installation ID, verified team/bot IDs, expiry, lifecycle
+ admin inspection of installation ID, verified team/bot IDs, session expiry (null for pending), lifecycle
  status and consumed result identifiers for pairing and lost-response recovery;
  do not expose a public installation listing or token-retrieval endpoint.
 
@@ -958,16 +976,23 @@ Persistence and release boundaries:
 
 - Add `0009_slack_oauth_installations`, containing a narrowly scoped pending
  installation/session table: opaque ID, hashed state/browser binding,
- expiry and lifecycle/claim fields, verified workspace/bot IDs,
+ nullable session-expiry and lifecycle/claim fields, verified workspace/bot IDs,
  encrypted pending token, and consumed result identifiers. These are temporary
  OAuth-session states, not generic lifecycle columns on active integrations.
+- Stage tokens under the provisioning lock in one transaction: lock the matching
+ claim, check/pin the encryption key before writing its ciphertext, then recheck
+ expiry and stage it. When the verifier is absent, any active workspace or any
+ pending ciphertext blocks bootstrap; no row is exempted. An expired session or
+ failed staging write rolls back the whole transaction, including a newly pinned
+ verifier. Invalid/duplicate claims return without pinning a key.
 - Use the shared database for atomic session claims and consumption across replicas.
  Normal restarts preserve unexpired unclaimed sessions and completed exchanges.
  A crash during a claimed external exchange must surface a fresh-authorization
  path; never imply exactly-once execution of Slack's external API.
-- Enforce expiry during every claim/provisioning operation; expired records may
- be inspected only as sanitized status and may never be consumed. Provide bounded
- cleanup for expired/consumed records and ciphertext, and rate-limit the public
+- Enforce session expiry during claim and staging. Pending installations have no
+ expiry and are available only while pending; consumption or cancellation clears
+ their ciphertext. Cleanup skips pending records and processes expired sessions
+ and consumed/cancelled receipts in bounded batches, and rate-limit the public
  OAuth entry points to bound session/pending-record growth. Installations in
  different browser cookie contexts and database records stay independent. Invalid
  callbacks must not claim or mutate an unrelated database session. Within one
@@ -1007,7 +1032,7 @@ Acceptance and release gate:
  tenant/GitHub/channel/replacement inputs must never activate service access,
  trigger product workflows or replace an active integration.
 - Test simultaneous independent installations, duplicate callback races, replica
- handoff and restart, ambiguous code-exchange failure, pending-token expiry,
+ handoff and restart, ambiguous code-exchange failure, old pending-token availability, cancellation,
  failed provisioning/retry, atomic consumption, and same-team reinstall isolation.
 - Include at least three distinct workspace/GitHub-owner pairs in automated
  coverage. Adding another tenant uses the same routes and configuration; no
@@ -1045,39 +1070,45 @@ above throughout.
    logging, bounded timeouts and disabled retries.
    **Verify:** the service builds; startup/health needs no live Slack call; absent
    OAuth configuration disables the feature and partial/invalid configuration fails.
-2. **Persistent installation storage.** Add B2 migration `0009` and storage
+2. **Persistent installation storage (implemented 2026-09-10).** Add B2 migration `0009` and storage
    operations for hashed session secrets, atomic claims, encrypted pending tokens,
    expiry, consumption and bounded cleanup.
    **Verify:** seeded database tests pass for duplicate/expired claims, encryption
    and ciphertext cleanup; migration forward/down/forward preserves active tenants.
    Keep C/D migration renumbering within the integration boundary specified above.
-3. **Public installation start.** Implement the fixed start route using the SDK's
+3. **Public installation start (implemented 2026-09-10).** Implement the fixed start route using the SDK's
    direct redirect, fresh state, independent browser binding, the cookie-header
    adapter and rate limiting.
    **Verify:** HTTP tests observe the Slack redirect, required scopes and both
    cookies' security attributes; attempts get distinct state and excess starts
    are limited without modifying existing sessions.
-4. **OAuth callback and pending installation.** Verify browser binding, let the
+4. **OAuth callback and pending installation (implemented 2026-09-10).** Verify browser binding, let the
    SDK claim state and exchange the code, validate its normalized installation,
    cross-check Slack identity, and stage the encrypted token with a safe completion
    response.
    **Verify:** actual SDK handlers against fake Slack endpoints produce one pending
    record on success; invalid, expired or replayed callbacks cannot stage tokens;
    identity/scope/token-model checks, cookie cleanup and secret redaction pass.
-5. **Operator provisioning and status.** Extend `provision-tenant` with
+5. **Operator provisioning and status (implemented 2026-09-10).** Extend `provision-tenant` with
    `--slack-installation-id` and add sanitized status inspection. Reuse existing
-   pairing checks and atomically activate the tenant, consume the installation and
-   clear its staged ciphertext; retain manual-token input.
-   **Verify:** compiled CLI tests cover successful activation, unchanged tenants
-   after validation/transaction failures, retryable pending records, status-based
-   recovery and the existing manual-token path.
-6. **Concurrency, recovery and tenant isolation.** Exercise the complete flow
+   pairing checks and copy the provider-validated pending envelope unchanged into
+   active storage. Atomically activate the tenant, consume the installation and
+   clear its staged ciphertext. Replace consumption's decrypted-token comparison
+   with exact matching of the validated, pending and active envelopes in the same
+   change; retain key verification, pairing guards, cancellation/consumption checks and manual-token
+   input encryption.
+   **Verify:** compiled CLI tests cover successful activation with an unchanged
+   envelope, rejection of an old active token or changed pending envelope,
+   wrong-key/workspace-AAD rejection, unchanged tenants after validation/transaction
+   failures, retryable pending records, status-based recovery and the existing
+   manual-token path.
+6. **Concurrency, recovery and tenant isolation (implemented 2026-09-10).** Exercise the complete flow
    across replicas/restarts, concurrent callbacks/provisioning, reinstalls and
    interrupted exchanges, including the accepted SDK browser-restart behavior.
    **Verify:** tests with at least three workspace/GitHub pairs prove single
    consumption, no automatic exchange retries, no cross-tenant effects or staged
    token use by runtime handlers, and safe recovery without secret leakage.
-7. **Live verification and release readiness.** Complete the configuration and
+7. **Live verification and release readiness (local packaging/rollback verified; hosted gate open).** Complete the configuration and
    operations runbook, packaged-image checks, rollback rehearsal and hosted
    installation/provisioning in two real workspaces.
    **Verify:** both tenants pass the end-to-end smoke matrix; record migration/
@@ -1881,7 +1912,7 @@ Resolved issues from checking the simplification:
 - The operator previously received the record ID at invitation creation. The
   sanitized completion page now supplies the pending installation ID and verified
   workspace, with read-only admin inspection for pairing and recovery.
-- Public initiation needs bounded resource use. Retained session/pending expiry
+- Public initiation needs bounded resource use. Retained session expiry and pending cancellation
   and cleanup, added rate-limiting acceptance coverage, and kept independent
   sessions and atomic callback claims across replicas.
 - A pending Slack token already carries Slack permissions. Explicitly restricted
@@ -1990,7 +2021,7 @@ Other explicit tradeoffs if using stock SDK behavior:
   headers, disabled exchange retries (including rate-limit retries), verified
   app/team/bot/scopes and the auth.test cross-check. These can be retained with
   configuration and application integration rather than accepted as losses.
-- Keep database-backed atomic state claims, encrypted pending storage, expiry,
+- Keep database-backed atomic state claims, encrypted pending storage, session expiry,
   operator-only pairing and atomic activation/consumption through the SDK's custom
   state/installation-store hooks and existing provisioning operations. Defaults
   alone do not implement these guarantees.
@@ -2029,7 +2060,7 @@ Resolved issues from reviewing the switch:
   both no-retry settings, safe logger/callbacks, query redaction and response headers.
 - SDK installation completion must not activate tenants or replace active tokens.
   Keep operator provisioning and its existing validations, uniqueness/re-pairing
-  guards, pending expiry and transactional activation/consumption. Scope acceptance
+  guards, pending cancellation and transactional activation/consumption. Scope acceptance
   checks to the retained guarantees and explicitly accepted SDK behavior.
 - The SDK has no SameSite option. Clarify that the HTTP response adapter adds
   `SameSite=Lax` to its outgoing cookie header before transmission and preserves
@@ -2038,7 +2069,7 @@ Resolved issues from reviewing the switch:
 
 ## PR B2 development milestones (2026-09-09)
 
-At Romain's request, break B2 into seven sequential milestones with independent
+B2 is split into seven sequential milestones with independent
 verification gates: SDK/configuration, storage, public start, callback/staging,
 operator provisioning/status, concurrency/recovery/isolation, and live release
 readiness. This organizes the accepted design; it does not change scope or mark
@@ -2081,3 +2112,483 @@ Public OAuth routes, independent browser binding, persistent storage, callback
 validation/staging, and provisioning remain subsequent milestones. No migration
 was added, no C changes were integrated, and B's legacy compatibility writes remain.
 No production configuration, installation, or release was performed.
+
+
+### B2 milestone 2 implementation review — 2026-09-10
+
+Updated after the review: pending installations have no local expiry. The
+unshipped 0009 schema uses null `expires_at` for pending/consumed rows; session
+and terminal receipt timestamps retain their existing roles. Old pending records
+survive cleanup and can activate; cancellation during a lock wait still rolls
+back activation. The 10-minute session timeout and 24-hour receipt retention remain.
+
+Milestone 1 was committed as `750e8a4` on `feat/oidc-multitenancy-pr-b2` before
+starting this step. Milestone 2 adds the static `0009_slack_oauth_installations`
+provider entry and PostgreSQL operations for independent hashed state/browser
+secrets, single-use claims, encrypted staging, sanitized status, transactional
+consumption, cancellation and bounded cleanup. Session lifetime is ten minutes;
+pending installations have no local expiry (scope updated on 2026-09-10). Terminal records are retained for 24 hours after
+expiry/cancellation or consumption. These are storage primitives; public routes,
+their cleanup scheduling and pending-installation operator commands remain later
+milestones. See the [storage and rollback runbook](../setup-and-operations.md#persistent-installation-storage).
+
+The gstack code review found and resolved the following issues before completion:
+
+- **Resolved P2 — consumption could acknowledge an older active token.** Matching
+  only the enabled tenant, workspace/bot and GitHub identities allowed a reinstall
+  to be consumed while the active workspace still held its previous token.
+  Consumption now checks the database key verifier and decrypts/compares the active
+  and staged tokens inside the provisioning transaction, before ciphertext clearing. A regression proves the old token is refused and
+  the matching new token succeeds; failed transactions preserve retryability.
+- **Resolved test gap — expiry fixtures did not distinguish the database clocks.**
+  Setting expiry one second in the past could still pass if the code regressed to
+  transaction-frozen `now()`. Lock-wait tests now set expiry one microsecond after
+  the blocked transaction began and confirm it is past before releasing the lock,
+  keeping timestamp precision inside PostgreSQL. This exercises `clock_timestamp()`
+  at claim and staging after lock waits. Consumption instead tests cancellation
+  during lock waits; pending installations no longer expire.
+
+Other verified safeguards include pending-only encryption-key pinning and
+missing-verifier rejection, AAD corruption alerts without credential logging,
+separate database connections/reconnects, concurrent duplicate claims/staging/
+consumption, same-team reinstall isolation, secret clearing and bounded cleanup
+with locked rows skipped. Rollback locks the table and refuses every unconsumed
+active lifecycle row until cancellation/cleanup; forward/down/forward preserves
+active tenant integrations and their key verifier. C's separate branch remains
+untouched, with its migration renumbering deferred to B2 integration.
+
+Verification passed: workspace typecheck and lint; the complete PostgreSQL service
+selftest suite, including the new storage suite and pending-token startup/readiness
+regressions; service/production-image build; compiled migration provider at `0009`;
+image startup/health with OAuth configured or disabled; sanitized rejection of
+partial OAuth configuration; and pending-only image startup refusal for a missing
+or mismatched encryption key. With a verified key, a corrupt pending token emits a
+sanitized alert and keeps health available. The tightened expiry fixture also
+passed a focused rerun and typecheck. No unresolved milestone-2 review findings
+remain. Live Slack installation, production migration and deployment were not
+performed; they belong to the later milestones and release gate.
+
+
+### B2 crypto simplification review — 2026-09-10
+
+This review covered the diagrams/design and implementation of only the first
+simplification. Source inspection confirmed both opportunities:
+
+- **Implemented — first-key bootstrap exemption removed.** `newPendingId` exists only
+  because staging previously wrote ciphertext before checking the key. Move the
+  guard before the write, so every stored token counts and the helper needs no
+  caller-supplied exemption. Preserve the provisioning lock and atomic first-key
+  pinning with the first successful token write.
+- **Rollback requirement — expiry after key pinning.** Merely moving the guard
+  and returning `false` when the final update finds an expired session would commit
+  a newly inserted verifier without a token. Abort that transaction, then map only
+  this known expiry outcome back to `false`; propagate other errors. Regression
+  coverage must force expiry between pinning and staging and a failed token write,
+  proving neither can persist the new verifier or change the claim.
+- **Milestone 5 target — transfer the existing envelope.** Pending and active
+  encryption use the same key, envelope format and verified workspace AAD. Copying
+  that authenticated envelope avoids encrypting the same plaintext again, then
+  decrypting two envelopes to compare it. This is a copy, not IV reuse for another
+  encryption. Keep provider validation before the transaction and match the exact
+  validated envelope against both pending and active rows inside it. Preserve the
+  older-token regression from the milestone 2 review above. The current decrypt/
+  compare guard stays until the provisioning path and guard change together in
+  milestone 5. No key rotation or installation-specific AAD is introduced here.
+
+Separately maintained supporting crypto diagrams show the implemented first-key
+ordering and milestone 5 ciphertext transfer.
+OAuth claims, browser binding, pending isolation, key verification and expiry/
+cleanup retain their existing roles.
+
+Implementation verification: `ensureSlackTokenKey` now has only transaction/key
+arguments, checks every existing pending ciphertext and runs before staging writes.
+The focused PostgreSQL test forces expiry during first-key insertion and confirms
+that staging returns `false` with both verifier and claim unchanged. A separate
+forced database write failure propagates and rolls back the same state. Existing
+missing-verifier, wrong-key, duplicate/concurrent staging and lock-wait expiry
+coverage also passes. Workspace typecheck/lint, the complete service selftest suite
+and service build passed after this change. All three affected diagrams were
+re-rendered to SVG/PNG/Excalidraw and visually checked; lifecycle transitions did
+not change. Milestone 5's ciphertext transfer was subsequently implemented and tested.
+
+
+## Crypto engineering review — 2026-09-10 (beta scope complete)
+
+Historical review, before the remaining B2 routes and commands were implemented.
+See the current milestone status and [execution evidence](feature-rec-b2-verification.md)
+for subsequent fixes and tests. Original planned-test markers below describe the
+review-time state, not remaining implementation work.
+
+Requested with `/plan-eng-review`, emphasizing the simplest secure design. Scope
+is the Slack OAuth crypto design and its current implementation boundaries, not
+an expansion of the multitenancy rollout. Application code is unchanged by this
+review. Findings below distinguish accepted beta deferrals from required implementation. No new application-code changes were made by this review.
+
+### Step 0: scope challenge
+
+**What already exists.** Node's `crypto` supplies AES-256-GCM, secure randomness,
+SHA-256 and HMAC; the small envelope module reuses these primitives. Slack's
+`InstallProvider` supplies OAuth redirects, cookie/state checks and code exchange.
+The PostgreSQL provisioning transaction/lock and active workspace token storage
+already exist. B2 adds a single session/pending table and uses those same key and
+provisioning boundaries; it does not need a second credential vault or crypto
+service. The latest first-key ordering and milestone 5 envelope-copy decisions
+remain accepted.
+
+**Minimum scope.** Preserve authenticated encryption with the verified workspace
+ID as AAD, independent browser binding, atomic single-use claims, pending/active
+isolation, key verification and expiry checks. Review the concrete crypto modules
+and their integration seams; unrelated C/D migration and product-flow changes are
+outside this review. The broader B2 diff spans more than eight files, principally
+schema/storage, integration, tests and documentation. That file count does not
+establish duplicate crypto architecture; no new classes or infrastructure are
+needed for this scoped design.
+
+**NOT in scope.** KMS/envelope encryption, per-tenant keys, online automatic key
+rotation, a new OAuth framework, encrypted session payloads and runtime token
+caching. These do not close a demonstrated gap in the current beta requirements.
+No new distributable artifact is introduced; existing service/admin build and
+image CI remain the distribution path. No repository `TODOS.md` exists.
+
+**Primary-source checks.** Read RFC 9700 section 2.1 on single-use state bound to
+the browser, Slack's SDK documentation and installed 4.0.0 implementation, Node's
+crypto documentation, PostgreSQL's clock documentation and OWASP's Cryptographic
+Storage Cheat Sheet. PostgreSQL `clock_timestamp()` continues to be the correct
+clock after waits. Slack's installed SDK compares its cookie directly with the
+URL state before calling the state store (install-provider.js:442-449); an
+independent secret closes the explicit leaked-URL/reconstructed-cookie scenario.
+
+### Architecture finding 1: emergency replacement of a compromised key
+
+**[P3 follow-up] (confidence: 8/10), decision D1 resolved: defer for beta.**
+
+Evidence: this plan's Secret handling section says “Back up the verifier with the
+database and retain the key separately; no automatic verifier reset or key
+rotation is allowed” (lines 230-231 at review time). The operational recovery
+instruction says “Never delete the verifier to bypass a key mismatch; restore the
+matching backup/key” (`docs/setup-and-operations.md:492-493`). Key rotation/KMS is
+explicitly deferred in the earlier not-in-scope section. These are valid controls
+for accidental configuration drift, but there is no documented/tested path for
+retiring a compromised encryption key. Restoring the same key does not resolve
+that incident. This is a recovery-design gap, not evidence that any key leaked.
+
+**Recommendation [Layer 1].** Keep automatic/online rotation and KMS deferred, but
+plan one operator-run, offline replacement procedure using existing crypto and
+transaction primitives. Stop all writers, verify the old key, re-encrypt retained
+credentials with fresh IVs and a new key, and replace their verifier atomically.
+Do not print secrets. Cover rollback and restoring backups encrypted with the old
+key. If Slack tokens may have been exposed, replacing their encryption is
+insufficient: revoke/reinstall the affected Slack credentials as part of incident
+recovery. Accept maintenance downtime instead of introducing key rings and dual-key
+runtime logic. No procedure or command is implemented or approved by this review.
+
+**Alternative.** Retain the current B2 scope and explicitly defer this recovery
+path until before expanding beyond controlled test tenants. That saves immediate
+work but leaves an incident dependent on an improvised maintenance script.
+
+**Source:** [OWASP Cryptographic Storage Cheat Sheet, key lifetimes and rotation](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html#key-lifetimes-and-rotation).
+
+**Beta scope decision D1:** Keep only necessary work. Defer the replacement script/runbook for
+this beta, keeping the existing stable key, separate backup and fail-closed
+mismatch checks. This is an accepted operational limitation, not a beta release
+blocker. Revisit when moving beyond the beta or when incident/operational needs
+justify it. Automatic rotation, key rings and KMS remain outside scope. Continue
+the remaining review without reopening this scope decision.
+
+
+### Code quality: no required beta changes
+
+The crypto helper is one small module over Node's built-in primitives. The
+ciphertext format, 32-byte key, 12-byte IV, 16-byte tag and workspace AAD are
+explicit. The shared key guard owns verifier checks; staging's local expiry
+sentinel preserves rollback without introducing an exception class or framework.
+The pending/active token comparison still protects reinstalls until the already
+accepted milestone 5 envelope-copy path lands. Keep it until that path changes.
+
+The independent browser secret is not another encryption layer: it keeps a leaked
+OAuth URL from supplying every value required to claim the browser session. The
+pending table separates Slack approval from operator activation. Neither is a
+candidate for removal under this review's beta scope.
+
+**Suppressed finding:** `slack-token-crypto.ts:32` exposes `iv?: Buffer`, and line
+37 uses `input.iv ?? crypto.randomBytes(IV_BYTES)`. A public-input nonce-reuse claim
+has confidence 3/10: all production callers omit this argument; the sole override
+is the deterministic fixture in `scripts/selftest.mts:497`. There is no observed
+production IV reuse or attacker-controlled IV path. Removing this test seam would
+be optional cleanup, so it is deferred under the accepted beta scope. Do not
+inflate this observation into a vulnerability or introduce a new RNG abstraction.
+
+### Test review and coverage map
+
+Framework: the repository uses `node:assert/strict` in TypeScript selftests run
+through `tsx`, real disposable PostgreSQL databases, and injected provider fakes.
+The authoritative service command is `make selftest-service`. This review read
+those tests and ran a separate probe against the actual crypto helper; it did not
+rerun the full suite or any live Slack flow. Earlier implementation test results
+remain recorded above, separately from this review's evidence.
+
+Legend: `[T***]` = repository tests cover behavior plus failures; `[P]` = already
+planned integration coverage; `[R]` = this review's executable probe, not a durable
+repository test. The map is a scenario/branch inventory, not measured line coverage.
+Do not interpret it as a 100% coverage claim.
+
+```text
+CODE PATHS / BRANCHES                           USER FLOW / OBSERVABLE OUTCOME
+slack-token-crypto.ts
+  parseKey: absent -> null; invalid base64/size -> reject [T*** partial guards]
+  encrypt: reject empty token/team/bad key/IV size; otherwise AES-GCM
+    same token encrypted repeatedly -> fresh IV [R]
+    normal envelope + decrypt round trip [T***]
+  decrypt: bad version/field count/base64/IV/tag sizes -> reject [R]
+    wrong key or team AAD / modified ciphertext -> reject [T***]
+    correctly encoded bit changes to IV/tag/ciphertext -> reject [R]
+
+slack-oauth.ts (SDK configuration)
+  absent config -> disabled; partial/invalid -> reject [T***]
+  valid config -> direct install, verified state, supplied stores [T***]
+  state cookie missing/wrong -> no state claim or exchange [T***]
+  code exchange: success | 429 | 503 | network failure | abort [T***]
+    failures -> no exchange retry, safe logger categories [T***]
+
+storage/slack-oauth.ts
+  create -> independent random state/binding, hashes only [T***]
+  validSecrets/hash -> reject malformed or mismatched secrets [T***]
+  hasBinding -> matching awaiting + unexpired | false [T***]
+  claim -> lock row -> expiry check -> one claim | null [T***]
+    duplicate/replica/restart/expiry during lock wait [T***]
+  stage -> invalid IDs/credentials rejected; matching claim required
+    lock -> ensureKey -> recheck expiry -> pending [T***]
+    wrong key/missing verifier/duplicate -> no new pending token [T***]
+    expiry after pin / database write error -> rollback pin + token [T***]
+  status -> invalid/missing ID | sanitized lifecycle/receipt [T***]
+    elapsed session expiry is visible before cleanup; pending expiry is null [T***]
+  readPending -> invalid/missing/non-pending | decrypted credential [T***]
+    wrong key/AAD or corruption -> sanitized error [T***]
+  consume -> transaction + valid IDs required -> key + row lock
+    pending unavailable/changed | wrong integration | older token -> reject [T***]
+    matching enabled integrations + token + pending status -> consumed [T***]
+    concurrent calls / cancellation after waits / later failure -> single commit [T***]
+  cancel -> active states clear secrets | terminal/missing -> false [T*** partial]
+  cleanup -> validate bound -> lock eligible rows, skip busy rows [T***]
+    expired session -> clear secrets; old receipt -> delete; pending -> untouched [T***]
+
+storage/slack-token-check.ts / startup
+  ensureKey: existing matching verifier -> allow; wrong -> reject [T***]
+    no verifier + any active/pending token -> reject [T***]
+    empty credentials -> pin only with successful write [T***]
+  inspect: empty DB -> allow without key [T***]
+    stored key/token + absent/wrong key or missing verifier -> stop [T***]
+    verified key + isolated corrupt token -> safe alert, other tenants work [T***]
+
+admin-operations.ts / slack-resolver.ts
+  provider identity + channel validation before transaction [T***]
+  manual provisioning -> encrypt, key/pairing guard, atomic activation [T***]
+  runtime lookup -> unknown/disabled tenant rejects, enabled decrypts [T***]
+  bad ciphertext/key -> sanitized failure; no pending-token runtime path [T***]
+
+BROWSER -> SLACK -> PENDING -> OPERATOR -> ACTIVE (not wired yet)
+  start: fresh cookies, SameSite adapter, request limits, cleanup [P, M3]
+  callback: browser binding BEFORE claim; normalized identity/scopes [P, M4]
+    denial, missing code, malformed identity/token fields -> safe restart [P, M4]
+  close tab/ambiguous exchange -> start over, never exchange twice [P, M4/M6]
+  second tab/forged cookie/replica race -> documented isolation [P, M3/M4/M6]
+  provision: exact validated envelope copy + consume, manual path retained [P, M5]
+    changed or cancelled pending/old active token -> rollback, safe retry [P, M5/M6]
+  lost success response -> sanitized status shows committed IDs [P, M5]
+  two real workspaces -> end-to-end isolation and image/rollback smoke [P, M7]
+```
+
+The current tests are strong on database races, rollback, browser-secret forgery,
+wrong keys/AAD, tenant isolation and secret-free errors. Individual invalid-input
+branches are not all covered by dedicated persistent assertions. Three optional
+unit-test gaps are recorded, rather than hidden behind the successful probe:
+
+1. **[P3, confidence 9/10] Default-IV freshness.** The committed source fixture
+   supplies a fixed IV (`scripts/selftest.mts:493-498`) and asserts format and round
+   trip. No repository assertion specifically fails if the default RNG were
+   replaced with a constant. The review probe encrypted 32 copies with 32 distinct
+   IVs. If expanded later, assert distinct default IVs and successful decryption in
+   this same test block; no statistical randomness suite is needed.
+2. **[P3, confidence 9/10] Separate authenticated-field mutations.** Existing tests
+   cover wrong workspace and corrupted ciphertext (`selftest.mts:501-506`). The
+   review additionally flipped decoded bits in IV, tag and ciphertext, keeping
+   base64 valid, and confirmed rejection for each. If expanded later, preserve
+   this distinction so a parser rejection is not mistaken for a GCM tag check.
+3. **[P3, confidence 8/10] Envelope/parser boundary matrix.** Unsupported version,
+   extra/missing fields, malformed base64 and wrong IV/tag lengths are guarded in
+   `slack-token-crypto.ts:53-61`; the review exercised representative cases. Not all
+   are individual repository assertions. If expanded later, add a compact table
+   of malformed envelopes to the existing selftest, including key-size/empty-input
+   guard cases. Do not add a new testing framework.
+
+**Disposition:** Keep work only if necessary for the
+beta and otherwise be deferred. These are regression-hardening opportunities,
+not demonstrated implementation defects; defer them. The existing M3-M7 HTTP,
+provisioning, concurrency and live-release tests remain necessary work already in
+scope. There are zero newly identified critical gaps in that planned coverage.
+No LLM prompts or evaluation behavior changed, so no LLM eval suite is implicated.
+
+### Performance: no required beta changes
+
+The verifier lookup is a singleton query. Bootstrap checks stop after finding one
+existing credential. Startup deliberately scans/decrypts active and pending
+credentials once; this is linear in stored credentials, not a repeated per-request
+full scan. Runtime resolves and decrypts one active workspace per logical operation.
+The global provisioning lock serializes short database writes, with provider
+network calls outside the transaction. This is appropriate for beta installation
+traffic; finer locks would add ownership/first-key races without a demonstrated
+throughput need. Cleanup is bounded and skips locked rows. Keep the existing
+planned request limits/cleanup wiring to bound abandoned-session growth. No cache,
+worker queue or additional crypto service is warranted. No load benchmark was run.
+
+### Failure modes and operator/user experience
+
+| Path | Realistic failure | Coverage / handling | User result |
+|---|---|---|---|
+| Start/browser binding | Another tab replaces cookies; forged callback | SDK/storage tests now, real-route integration M3-M4 | Restart authorization; no unrelated session consumed |
+| Claim/exchange | Duplicate delivery or lost provider response | Atomic-claim and no-retry tests now; full flow M4/M6 | Fresh authorization for ambiguous exchange |
+| Staging/key pin | Key misconfiguration, late expiry or failed write | PostgreSQL tests; transaction rolls back | Safe failure; no orphan pin or active-token replacement |
+| Pending read | Wrong key/AAD or corrupt envelope | Existing tests and review probe; sanitized rejection | No token disclosed or activated |
+| Activation/consume | Reinstall, competing operator, changed/cancelled pending token | Primitive tests; exact-copy CLI integration M5/M6 | Rollback preserves previous active credentials |
+| Status/recovery | Success response is lost | Receipt storage tested; CLI M5 | Inspect sanitized IDs to learn outcome |
+| Startup/runtime | Wrong deployment key or one corrupt token | Startup/resolver tests | Wrong key stops startup; isolated corruption alerts without affecting valid tenants |
+| Cleanup | Busy record or expired session before sweep | Bounded/skip-locked and expiry tests | Session expiry already enforced; pending records stay until activation/cancellation |
+| Key compromise | Existing key must be retired | D1 explicitly deferred for beta | Maintenance/reinstall may be needed; no automated recovery claim |
+
+Critical gaps (no handling AND no test AND silent failure): **0** in the reviewed
+crypto design. Planned HTTP/CLI behavior is not represented as implemented.
+
+### Diagrams, tasks and execution
+
+The crypto sequence/state diagrams are updated for pending installations without
+expiry: staging clears the session deadline, activation checks pending status,
+and only OAuth sessions can transition to expired. This later implementation
+change supersedes the pending-expiry assumptions in the original review.
+The original key-recovery tooling deferral remains unchanged.
+
+**Implementation Tasks:** No new beta implementation tasks from Architecture,
+Code Quality, Tests or Performance. Recovery tooling and optional unit-test
+hardening are explicitly deferred by the beta scope decision; keep their context
+in this plan instead of creating a second TODO backlog. No `TODOS.md` items added.
+Existing milestones 3-7, including the accepted milestone 5 ciphertext transfer,
+remain unchanged. The eng-review task JSONL is intentionally empty (review ran,
+no new beta tasks).
+
+Sequential implementation, no parallelization opportunity for the scoped crypto
+changes: callback storage and pending-ID provisioning share the same storage/admin
+contracts. Do not create worktrees or agents for optional cleanup. Outside voice:
+skipped; this review used source inspection, primary documentation and a focused
+crypto probe, and introduced no architectural expansion.
+
+### Completion summary
+
+- Step 0: scope retained for beta; optional recovery work deferred by the beta scope decision.
+- Architecture: 1 recovery finding, deferred; no new beta blocker.
+- Code quality: 0 actionable beta findings; IV-control exploit claim suppressed.
+- Tests: coverage diagram produced; 3 optional persistent-test gaps deferred;
+  existing planned HTTP/CLI/release tests retained; 0 new critical gaps.
+- Performance: 0 findings requiring beta changes.
+- NOT in scope / What already exists: written above.
+- TODOS.md: 0 new proposals beyond the already-resolved beta deferral.
+- Failure modes: 0 critical silent gaps identified in the reviewed design.
+- Outside voice: skipped.
+- Parallelization: 1 sequential lane, 0 parallel lanes.
+- Lake Score: no new complete-option scope expansion; beta deferrals are explicit.
+- Verdict: crypto design review complete for beta; this does not clear the
+  unfinished B2 implementation or its live release gates.
+
+
+## B2 remaining implementation and review — 2026-09-10
+
+Milestones 3–6 and the local portion of 7 are implemented. The HTTP routes use
+request-local SDK instances, independent browser binding, atomic state claims,
+verified encrypted staging, fixed request budgets and bounded cleanup with graceful
+shutdown. Operator activation copies the validated ciphertext unchanged and consumes
+the pending installation in the same transaction; status/cancel and manual input work.
+Pending installations retain no local expiry.
+
+Independent implementation review found and resolved two HTTP issues:
+
+- **Query leakage on missing routes:** Fastify's default 404 handler logged and
+  echoed the raw URL despite the request serializer. A fixed not-found handler and
+  disabled/wrong-method/unknown-route regressions now cover this path.
+- **Cookie cleanup after failed start:** stacking response header adapters could
+  replace deletion with the earlier BIND cookie. Adapters now wrap the original
+  setter; a failure injected after session persistence verifies both deletions and
+  recovery on the next start, without exposing secrets.
+
+The full CI gate, focused service/HTTP checks and production-image rollback harness
+passed. Three callback-created installations pass through operator validation,
+exact envelope transfer and tenant-specific runtime token lookup. Tests cover
+replica races, retries, single consumption and cleanup shutdown with real PostgreSQL
+locks. The retained B image rejects schema 0009 and starts after rollback to 0008;
+the B2 image starts after migrating forward again. See the
+[verification record](feature-rec-b2-verification.md) for reproducible commands.
+
+Live hosted installation, two real workspace/GitHub pairs, observation, backup and
+contract-readiness evidence remain release gates. This work did not deploy the
+service or modify live provider installations. The historical report below is the
+prior crypto plan review, not a new pre-landing review of these implementation changes.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | Not run | No product-scope expansion in this review |
+| Codex Review | Outside voice | Independent second opinion | 0 | Skipped | No outside voice requested for this beta review |
+| Eng Review | `/plan-eng-review` | Crypto architecture & tests | 1 | CLEAR (PLAN, beta crypto only) | 1 operational finding and 3 optional unit-test gaps explicitly deferred; 0 critical gaps |
+| Design Review | `/plan-design-review` | UI/UX | 0 | Not run | No UI implementation changes |
+| DX Review | `/plan-devex-review` | Developer experience | 0 | Not run | Existing SDK/CLI interfaces retained |
+
+**VERDICT:** Beta crypto design review complete with accepted deferrals. Keep the
+current protections and proceed with existing B2 milestones. This does not clear
+the unfinished HTTP/CLI integration, live two-workspace smoke, packaging/rollback
+release gates or the whole multitenancy plan. The earlier milestone 2 diff review
+predates the later key-guard simplification; this plan review is not a new
+pre-landing diff review.
+
+NO UNRESOLVED DECISIONS
+
+
+## B2 pre-landing review — 2026-09-11
+
+Scope: the complete B2 checkout, including committed SDK setup, uncommitted changes
+and untracked source/tests, against the merge base with `origin/main` (`8aad709`).
+Three independent reviewers checked HTTP/security, data/transactions and
+acceptance tests/packaging. C/D implementation and hosted release state were excluded.
+
+- **Resolved P2, confidence 9/10: missing simultaneous independent callback test.**
+  The original HTTP test awaited each callback in the three-workspace loop; the
+  overlapping callback case replayed one session. That did not meet this plan's
+  independent-installation concurrency requirement. The existing success fixture
+  now holds all three exchanges open on the same app, then completes them in
+  reverse order while retaining per-session completion, identity, ciphertext and
+  downstream activation assertions. No production race was demonstrated. The
+  focused HTTP suite, service typecheck and scoped ESLint pass.
+- **Resolved P3, confidence 10/10: stale implementation and rollback instructions.**
+  The plan header and `.env.example` still described milestone 1 only; the active
+  rollback runbook said operator cancellation was unavailable and routes could
+  not create sessions. Updated those statements, encryption-key requirements and
+  the unusable-pending-token recovery instruction. Rollback now shows a sanitized
+  query to identify unconsumed records and the compiled cancellation command, with
+  an empty-result check before downgrade. Historical milestone notes are retained.
+- **Resolved P3, confidence 10/10: inaccurate key-guard comment.** The staging comment
+  claimed every stored token was checked on each write, but an existing verifier
+  is checked directly. Clarified that the guard verifies/pins the deployment key;
+  runtime behavior is unchanged.
+
+No actionable security, transaction or migration defect was found. No previously
+skipped finding was suppressed. Pending expiry and optional crypto/key-rotation
+work remain deferred as decided. Local implementation/tests/docs are addressed;
+Slack distribution/redirect configuration, hosted two-workspace smoke, observation/
+contract-readiness and backup evidence remain externally unverified release gates.
+This review does not authorize deployment or C's integration.
+
+Full [review and plan completion audit](feature-rec-b2-review-2026-09-11.md).
+
+### PR publication check — 2026-09-11
+
+Resolved documentation-only publication issues: removed a personal machine path and
+transient test-session identifiers from the review record, paraphrased conversational
+attribution in the B2 decision history, and qualified no-PR statements as review-time
+history. The technical decisions and remaining hosted release gates are unchanged.
