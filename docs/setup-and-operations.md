@@ -301,8 +301,8 @@ compiled admin entrypoint with:
 docker run --rm --entrypoint node feature-rec-service:local dist/admin.js --help
 ```
 
-For an empty-database smoke test without live provider credentials, use the environment
-and readiness loop in [CI](../.github/workflows/ci.yaml).
+For an isolated-database smoke test without live provider credentials, run the
+[packaged-service smoke check](#smoke-checks), which is also used by CI.
 
 ### Runtime configuration
 
