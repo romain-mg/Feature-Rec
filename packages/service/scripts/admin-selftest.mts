@@ -632,13 +632,29 @@ try {
     await assert.rejects(provisionTenant({ ...oauthInput, providers: { ...oauthProviders,
       inspectSlackToken: async () => ({ ...mismatched, channelIds: ["COAUTH1"] }) } }), /live Slack workspace and bot/);
   }
-  for (const provider of ["inspectSlackToken", "inspectInstallationRepository"] as const) {
-    await assert.rejects(provisionTenant({ ...oauthInput, providers: { ...oauthProviders,
-      [provider]: async () => { throw new Error(`Untrusted provider body: ${first.token}`); } } }),
-    (error: Error) => { assert.match(error.message, /provider validation failed/); assert.ok(!error.message.includes(first.token)); return true; });
+  for (const [provider, expectedMessage] of [
+    ["inspectSlackToken", "Slack provider validation failed for pending installation; check bot access and retry"],
+    ["inspectInstallationRepository", "GitHub provider validation failed for pending installation; check App permissions and repository access, then retry"],
+  ] as const) {
+    const untrustedError = new Error(`Untrusted provider body: ${first.token}`, {
+      cause: new Error(`Untrusted provider cause: ${first.expectedCiphertext}`),
+    });
+    const failingProviders = { ...oauthProviders, [provider]: async () => { throw untrustedError; } };
+    await assert.rejects(provisionTenant({ ...oauthInput, providers: failingProviders }), (error: Error) => {
+      assert.equal(error.message, expectedMessage);
+      assert.equal(error.cause, undefined);
+      for (const sensitive of [first.token, first.expectedCiphertext, "Untrusted provider"]) {
+        assert.ok(!`${error.stack}${JSON.stringify(error)}`.includes(sensitive));
+      }
+      return true;
+    });
+    // Operator-supplied token provisioning retains the original provider error.
+    await assert.rejects(provisionTenant({ ...oauthInput, providers: failingProviders,
+      slackInstallationId: undefined, slackBotToken: first.token }), (error: Error) => error === untrustedError);
+    assert.deepEqual(await snapshot(), beforeOauth);
+    assert.equal((await getSlackOAuthInstallationStatus(db, first.id))?.status, "pending");
+    assert.equal((await readPendingSlackOAuthInstallation(db, first.id, key))?.expectedCiphertext, first.expectedCiphertext);
   }
-  assert.deepEqual(await snapshot(), beforeOauth);
-  assert.equal((await getSlackOAuthInstallationStatus(db, first.id))?.status, "pending");
 
   // A new envelope written after validation invalidates this provisioning attempt,
   // even when it decrypts to the same token. The previous tenant state rolls back.
@@ -708,11 +724,12 @@ try {
       const reply = (body) => new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
       if (url.origin === "https://slack.com") {
         if (new Headers(init?.headers).get("authorization") !== "Bearer " + process.env.CLI_TEST_TOKEN) throw new Error("Unexpected test credential");
-        if (process.env.CLI_TEST_PROVIDER_FAILURE) return reply({ ok: false, error: "invalid_auth", response_metadata: { messages: [process.env.CLI_TEST_TOKEN] } });
+        if (process.env.CLI_TEST_PROVIDER_FAILURE === "slack") return reply({ ok: false, error: "invalid_auth", response_metadata: { messages: [process.env.CLI_TEST_TOKEN] } });
         if (url.pathname === "/api/auth.test") return reply({ ok: true, team_id: process.env.CLI_TEST_TEAM, user_id: process.env.CLI_TEST_BOT });
         if (url.pathname === "/api/users.conversations") return reply({ ok: true, channels: [{ id: "CCLI" }] });
       }
       if (url.origin === "https://api.github.com") {
+        if (process.env.CLI_TEST_PROVIDER_FAILURE === "github") return new Response(JSON.stringify({ message: process.env.CLI_TEST_TOKEN }), { status: 403 });
         if (url.pathname.endsWith("/access_tokens")) return reply({ token: "fake-github-access-token" });
         if (url.pathname === "/app/installations/21001" || url.pathname === "/repos/Cli/Repo/installation") return reply({ id: 21001, account: { id: 21001 } });
         if (url.pathname === "/repos/Cli/Repo") return reply({ id: 21001, name: "Repo", full_name: "Cli/Repo", owner: { id: 21001, login: "Cli" } });
@@ -735,12 +752,20 @@ try {
     const provisionArgs = ["provision-tenant", "--environment", "selftest", "--confirm", "--installation-id", "21001", "--repository", "Cli/Repo", "--selected-channel-id", "CCLI", "--slack-installation-id", fourth.id];
     await assert.rejects(cli(provisionArgs.filter((arg) => arg !== "--confirm")), /requires --confirm/);
     await assert.rejects(cli(provisionArgs, { RAILWAY_ENVIRONMENT_NAME: "production" }), /does not match/);
-    await assert.rejects(cli(provisionArgs, { CLI_TEST_PROVIDER_FAILURE: "1" }), (error: Error & { stdout: string; stderr: string }) => {
-      assert.match(error.stderr, /provider validation failed/);
-      assert.ok(!error.stderr.includes(fourth.token));
-      assert.ok(!error.stdout.includes(fourth.expectedCiphertext));
-      return true;
-    });
+    const beforeCliFailure = await snapshot();
+    for (const [provider, expectedProvider] of [["slack", "Slack"], ["github", "GitHub"]]) {
+      await assert.rejects(cli(provisionArgs, { CLI_TEST_PROVIDER_FAILURE: provider }),
+      (error: Error & { stdout: string; stderr: string }) => {
+        assert.match(error.stderr, new RegExp(`${expectedProvider} provider validation failed`));
+        for (const sensitive of [fourth.token, fourth.expectedCiphertext, "fake-github-access-token"]) {
+          assert.ok(!`${error.stderr}${error.stdout}`.includes(sensitive));
+        }
+        return true;
+      });
+      assert.deepEqual(await snapshot(), beforeCliFailure);
+      assert.equal((await getSlackOAuthInstallationStatus(db, fourth.id))?.status, "pending");
+      assert.equal((await readPendingSlackOAuthInstallation(db, fourth.id, key))?.expectedCiphertext, fourth.expectedCiphertext);
+    }
     const activatedCli = await cli(provisionArgs);
     assert.equal(activatedCli.stderr, "");
     const activatedReceipt = JSON.parse(activatedCli.stdout);

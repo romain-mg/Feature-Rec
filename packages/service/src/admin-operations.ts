@@ -552,19 +552,22 @@ export async function provisionTenant(input: {
     throw new Error("Selected channel ID must not be empty");
   }
   positiveDecimal(input.installationId, "GitHub installation ID");
+  // Identify the failed provider without forwarding messages or causes that may
+  // quote response bodies or credentials. Manual-token errors stay unchanged.
   const [slack, repository] = await Promise.all([
-    input.providers.inspectSlackToken(token),
+    input.providers.inspectSlackToken(token).catch((error: unknown) => {
+      if (pending) throw new Error("Slack provider validation failed for pending installation; check bot access and retry");
+      throw error;
+    }),
     input.providers.inspectInstallationRepository(
       input.installationId,
       input.repository.owner,
       input.repository.repo,
-    ),
-  ]).catch((error: unknown) => {
-    // Provider failures can quote response bodies or credentials. Pending tokens
-    // must remain internal even when validation fails before the transaction.
-    if (pending) throw new Error("Pending Slack installation provider validation failed; check provider access and retry");
-    throw error;
-  });
+    ).catch((error: unknown) => {
+      if (pending) throw new Error("GitHub provider validation failed for pending installation; check App permissions and repository access, then retry");
+      throw error;
+    }),
+  ]);
   if (pending && (slack.teamId !== pending.teamId || slack.botUserId !== pending.botUserId)) {
     throw new Error("Pending Slack installation does not match the live Slack workspace and bot");
   }

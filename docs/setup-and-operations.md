@@ -654,8 +654,10 @@ node --env-file=.env packages/service/dist/admin.js cancel-slack-installation \
   --environment development --confirm --slack-installation-id <pending-id>
 ```
 
-The pending-ID path does not prompt for or print a token. It copies the exact
-validated ciphertext and consumes the record in the same activation transaction.
+The pending-ID path does not prompt for or print a token. Provider validation
+failures identify Slack or GitHub using fixed messages without exposing credentials
+or raw provider errors. It copies the exact validated ciphertext and consumes the
+record in the same activation transaction.
 If the response is lost, status exposes consumed tenant/installation identifiers.
 Status and cancellation only need database access, so broken provider credentials
 or an unavailable encryption key do not prevent inspecting/cancelling a record.
