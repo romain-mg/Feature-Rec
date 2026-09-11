@@ -175,8 +175,9 @@ export function buildServer(input: {
   const oidc = input.oidc ?? new GitHubOidcVerifier(env);
   const slackResolver = new SlackResolver(store, env.slackTokenEncryptionKey, input.slackClientFactory);
   const ephemeral = input.respondEphemeral ?? respondEphemeral;
-  const requestSerializer = (request: { method: string; url: string }) => ({
+  const requestSerializer = (request: FastifyRequest) => ({
     method: request.method, url: request.url.split("?")[0],
+    remoteAddress: request.ip, remotePort: request.socket.remotePort,
   });
   const app = Fastify({ logger: input.logger === false ? false : {
     ...(typeof input.logger === "object" ? input.logger : {}),

@@ -365,12 +365,20 @@ app signing secret continue to handle runtime Slack requests independently.
    access, so removal/revocation at Slack still prevents activation.
 
 Cookies use Secure/HttpOnly/SameSite=Lax with a ten-minute lifetime. Callbacks clear
-both cookies. The SDK supports one current attempt per browser cookie context;
+both cookies once admitted for processing. A callback rejected by the local rate
+limit or missing encryption-key configuration keeps both cookies and leaves the
+session untouched, allowing a retry within its original lifetime after recovery.
+The SDK supports one current attempt per browser cookie context;
 a second tab or failed callback can require a fresh start. An interrupted exchange
 cannot be replayed. SDK network requests have a ten-second timeout with no ordinary
 or rate-limit retries; the independent identity check has a five-second timeout.
 Responses use no-store/no-referrer and contain no third-party content. Automatic
-request logs omit query strings, and OAuth diagnostics emit fixed safe categories.
+request logs omit query strings while retaining the socket peer address. Callback
+failure logs include fixed phase/category fields and HTTP status, never raw errors
+or provider bodies. Invalid callbacks and rejected authorization codes return 400;
+unsupported installations/provider rejections return 502; storage, key configuration
+and transient provider failures return 503. A 5xx after processing begins still
+requires a fresh start: it does not make an already claimed code replayable.
 
 Each service process permits at most 30 starts and 120 callbacks per minute;
 excess requests return 429 with Retry-After. These are deployment-wide per-process

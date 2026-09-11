@@ -75,6 +75,7 @@ type Fixture = {
   token: string;
   response: Record<string, unknown>;
   identity: Record<string, unknown>;
+  identityAfterSdk?: Record<string, unknown>;
   mode?: "network" | "transient" | "rate-limit";
   gate?: ReturnType<typeof deferred>;
   entered?: ReturnType<typeof deferred>;
@@ -132,7 +133,7 @@ async function providerRequest(request: IncomingMessage, response: ServerRespons
   const value = tokenFixtures.get(token);
   assert.ok(value, "Only a token returned by the fake exchange may reach auth.test");
   identityReads.set(token, (identityReads.get(token) ?? 0) + 1);
-  response.end(JSON.stringify(value.identity));
+  response.end(JSON.stringify(identityReads.get(token)! > 1 ? value.identityAfterSdk ?? value.identity : value.identity));
 }
 const provider = createServer((request, response) => {
   void providerRequest(request, response).catch((error: unknown) => {
@@ -162,7 +163,7 @@ function safeResponse(response: HttpResponse, deletion = false) {
   assert.equal(response.headers["referrer-policy"], "no-referrer");
   if (deletion) {
     const cookies = cookieHeaders(response);
-    assert.equal(cookies.length, 2, "Every callback preserves both cookie-deletion headers");
+    assert.equal(cookies.length, 2, "Every processed callback preserves both cookie-deletion headers");
     for (const cookie of cookies) {
       assert.match(cookie, /; Secure(?:;|$)/i);
       assert.match(cookie, /; HttpOnly(?:;|$)/i);
@@ -217,10 +218,18 @@ type Session = Awaited<ReturnType<typeof start>>;
 function callback(server: App, session: Session, value: Fixture, cookie = session.cookie, suffix = "") {
   return server.inject({ method: "GET", url: `/api/slack/oauth/callback?${new URLSearchParams({ state: session.state, code: value.code })}${suffix}`, headers: { cookie } });
 }
-async function failed(response: HttpResponse, id?: string) {
+async function failed(response: HttpResponse, id?: string, status?: number) {
   assert.ok(response.statusCode >= 400, `Expected callback failure; got ${response.statusCode}`);
+  if (status !== undefined) assert.equal(response.statusCode, status);
   safeResponse(response, true);
   if (id) assert.notEqual((await raw(id)).status, "pending");
+}
+function failureLog(offset: number, phase: string, category: string, status: number) {
+  const events = logs.slice(offset).flatMap((chunk) => chunk.trim().split("\n"))
+    .map((line) => JSON.parse(line) as { event?: string; phase?: string; category?: string; status?: number })
+    .filter((entry) => entry.event === "SLACK_OAUTH_CALLBACK_FAILED");
+  assert.deepEqual(events.map((entry) => ({ phase: entry.phase, category: entry.category, status: entry.status })),
+    [{ phase, category, status }], "One safe diagnostic identifies the failing phase and classification");
 }
 
 try {
@@ -228,7 +237,19 @@ try {
   const primary = app();
   let replica = app(replicaDb);
   const beforeHealth = exchanges.size;
-  assert.equal((await primary.inject({ method: "GET", url: "/health" })).statusCode, 200);
+  const logOffset = logs.length;
+  const remoteAddress = "203.0.113.42";
+  assert.equal((await primary.inject({ method: "GET", url: `/health?private=${marker}`, remoteAddress })).statusCode, 200);
+  await failed(await primary.inject({
+    method: "GET", url: `/api/slack/oauth/callback?code=${marker}&state=${marker}`, remoteAddress,
+  }), undefined, 400);
+  const requestLogs = logs.slice(logOffset).flatMap((chunk) => chunk.trim().split("\n"))
+    .map((line) => JSON.parse(line) as { req?: { url?: string; remoteAddress?: string } });
+  for (const url of ["/health", "/api/slack/oauth/callback"]) {
+    const requestLog = requestLogs.find((entry) => entry.req?.url === url);
+    assert.ok(requestLog, "Request diagnostics retain the route while stripping query secrets");
+    assert.equal(requestLog.req?.remoteAddress, remoteAddress, "Request logs retain the socket peer address");
+  }
   assert.equal(exchanges.size, beforeHealth);
 
   // The SDK can fail after creating state and setting both cookies. Replacing
@@ -322,11 +343,11 @@ try {
   try {
     await concurrentFixture.entered!.promise;
     assert.equal((await raw(concurrent.id)).status, "exchanging");
-    await failed(await callback(replica, concurrent, concurrentFixture), concurrent.id);
+    await failed(await callback(replica, concurrent, concurrentFixture), concurrent.id, 400);
     assert.equal(exchanges.get(concurrentFixture.code), 1);
   } finally { concurrentFixture.gate!.resolve(); }
   assert.equal((await inflight).statusCode, 200);
-  await failed(await callback(replica, concurrent, concurrentFixture));
+  await failed(await callback(replica, concurrent, concurrentFixture), undefined, 400);
   assert.equal(exchanges.get(concurrentFixture.code), 1);
 
   // Supplying a copied callback URL and a forged state cookie is insufficient:
@@ -336,7 +357,7 @@ try {
   const browserValue = fixture("TBROWSER");
   const pristine = await raw(browser.id);
   for (const cookie of ["", `slack-app-oauth-state=${browser.state}`, `slack-app-oauth-state=${browser.state}; ${differentBrowser.bindingCookie.split(";")[0]}`, `${browser.bindingCookie.split(";")[0]}; slack-app-oauth-state=${differentBrowser.state}`]) {
-    await failed(await callback(replica, browser, browserValue, cookie), browser.id);
+    await failed(await callback(replica, browser, browserValue, cookie), browser.id, 400);
     assert.deepEqual(await raw(browser.id), pristine);
   }
   assert.equal(exchanges.has(browserValue.code), false);
@@ -345,17 +366,17 @@ try {
   const expired = await start(primary);
   const expiredValue = fixture("TEXPIRED");
   await db.updateTable("slack_oauth_installations").set({ expires_at: sql`clock_timestamp() - interval '1 second'` }).where("id", "=", expired.id).execute();
-  await failed(await callback(replica, expired, expiredValue), expired.id);
+  await failed(await callback(replica, expired, expiredValue), expired.id, 400);
   assert.equal(exchanges.has(expiredValue.code), false);
 
   const queryApp = app();
   const query = await start(queryApp);
   const queryValue = fixture("TQUERY");
   for (const suffix of ["&state=duplicate", "&code=duplicate", `&error=${marker}`]) {
-    await failed(await callback(queryApp, query, queryValue, query.cookie, suffix), query.id);
+    await failed(await callback(queryApp, query, queryValue, query.cookie, suffix), query.id, 400);
   }
   for (const queryString of ["", `?state=${query.state}`, `?code=${queryValue.code}`, `?state=${query.state}&error=access_denied`]) {
-    await failed(await queryApp.inject({ method: "GET", url: `/api/slack/oauth/callback${queryString}`, headers: { cookie: query.cookie } }), query.id);
+    await failed(await queryApp.inject({ method: "GET", url: `/api/slack/oauth/callback${queryString}`, headers: { cookie: query.cookie } }), query.id, 400);
   }
   assert.equal(exchanges.has(queryValue.code), false);
   // Untrusted hints may be ignored, but can never override our fixed redirect,
@@ -394,20 +415,50 @@ try {
   for (const [label, mutate] of invalidCases) {
     const session = await start(invalidApp);
     const value = fixture("TINVALID", mutate);
-    await failed(await callback(invalidApp, session, value), session.id);
+    const offset = logs.length;
+    await failed(await callback(invalidApp, session, value), session.id, 502);
+    const providerError = label.includes("provider error");
+    const identityMismatch = label.startsWith("wrong live");
+    failureLog(offset, providerError ? "slack_exchange" : identityMismatch ? "slack_identity" : "installation_validation",
+      providerError ? "slack_rejected" : identityMismatch ? "identity_mismatch" : "unsupported_installation", 502);
     assert.equal((await raw(session.id)).bot_token_ciphertext, null, label);
     assert.equal(exchanges.get(value.code), 1, label);
   }
+
+  for (const providerCode of ["invalid_code", "code_already_used", "internal_error"]) {
+    const session = await start(invalidApp);
+    const value = fixture("TCODEERROR", (current) => {
+      current.response = { ok: false, error: providerCode, response_metadata: { messages: [marker] } };
+    });
+    const offset = logs.length;
+    const status = providerCode === "internal_error" ? 503 : 400;
+    await failed(await callback(invalidApp, session, value), session.id, status);
+    failureLog(offset, "slack_exchange", status === 400 ? "invalid_code" : "slack_unavailable", status);
+    assert.equal((await raw(session.id)).bot_token_ciphertext, null);
+    assert.equal(exchanges.get(value.code), 1);
+  }
+
+  const identitySession = await start(invalidApp);
+  const identityValue = fixture("TIDENTITYERROR", (current) => {
+    current.identityAfterSdk = { ok: false, error: marker, response_metadata: { messages: [marker] } };
+  });
+  const identityOffset = logs.length;
+  await failed(await callback(invalidApp, identitySession, identityValue), identitySession.id, 503);
+  failureLog(identityOffset, "slack_identity", "slack_unavailable", 503);
+  assert.equal(identityReads.get(identityValue.token), 2);
+  assert.equal((await raw(identitySession.id)).bot_token_ciphertext, null);
 
   // Ambiguous exchanges cannot be replayed, even after another app takes over.
   for (const mode of ["network", "transient", "rate-limit"] as const) {
     const session = await start(invalidApp);
     const value = fixture("TNETWORK", (current) => { current.mode = mode; });
-    await failed(await callback(invalidApp, session, value), session.id);
+    const offset = logs.length;
+    await failed(await callback(invalidApp, session, value), session.id, 503);
+    failureLog(offset, "slack_exchange", mode === "rate-limit" ? "slack_rate_limited" : "slack_unavailable", 503);
     assert.equal(exchanges.get(value.code), 1);
     assert.equal(identityReads.has(value.token), false);
     const recovery = app(replicaDb);
-    await failed(await callback(recovery, session, value), session.id);
+    await failed(await callback(recovery, session, value), session.id, 400);
     assert.equal(exchanges.get(value.code), 1, `${mode} exchange never automatically retries`);
     await recovery.close();
   }
@@ -468,11 +519,23 @@ try {
     const response = await callbackLimited.inject({ method: "GET", url: `/api/slack/oauth/callback?code=${marker}` });
     assert.equal(response.statusCode, 400);
   }
-  const callbackLimit = await callbackLimited.inject({ method: "GET", url: `/api/slack/oauth/callback?code=${marker}` });
+  const limitValue = fixture("TLIMITRETRY");
+  const callbackLimit = await callback(callbackLimited, limitSession, limitValue);
   assert.equal(callbackLimit.statusCode, 429);
   assert.ok(Number(callbackLimit.headers["retry-after"]) > 0);
-  safeResponse(callbackLimit, true);
+  safeResponse(callbackLimit);
+  assert.deepEqual(cookieHeaders(callbackLimit), [], "Admission rejection leaves the browser's original cookies intact");
   assert.deepEqual(await raw(limitSession.id), limitBefore);
+  assert.equal(exchanges.has(limitValue.code), false, "Rate limiting happens before the session claim and code exchange");
+  const retryTime = Date.now() + 60_001;
+  const clockMock = mock.method(Date, "now", () => retryTime);
+  try {
+    const retry = await callback(callbackLimited, limitSession, limitValue);
+    assert.equal(retry.statusCode, 200, "The browser can retry its original callback and cookies after the budget resets");
+    safeResponse(retry, true);
+    assert.equal((await raw(limitSession.id)).status, "pending");
+    assert.equal(exchanges.get(limitValue.code), 1);
+  } finally { clockMock.mock.restore(); }
 
   // Not-found handling can leak raw URLs independently of the request
   // serializer, so exercise disabled routes, wrong methods and unknown paths.
@@ -499,13 +562,64 @@ try {
   const unavailable = await noKey.inject({ method: "GET", url: "/api/slack/oauth/start" });
   assert.equal(unavailable.statusCode, 503); safeResponse(unavailable);
   assert.equal(await sessionCount(), countBeforeMissingKey);
-  const unavailableCallback = await noKey.inject({ method: "GET", url: `/api/slack/oauth/callback?code=${marker}` });
-  assert.equal(unavailableCallback.statusCode, 503); safeResponse(unavailableCallback, true);
+  const noKeySession = await start(primary);
+  const noKeyBefore = await raw(noKeySession.id);
+  const noKeyValue = fixture("TNOKEYRETRY");
+  const unavailableCallback = await callback(noKey, noKeySession, noKeyValue);
+  assert.equal(unavailableCallback.statusCode, 503); safeResponse(unavailableCallback);
+  assert.deepEqual(cookieHeaders(unavailableCallback), [], "An unavailable replica preserves cookies for a configured replica");
+  assert.deepEqual(await raw(noKeySession.id), noKeyBefore);
+  assert.equal(exchanges.has(noKeyValue.code), false);
+  const configuredRetry = await callback(primary, noKeySession, noKeyValue);
+  assert.equal(configuredRetry.statusCode, 200);
+  safeResponse(configuredRetry, true);
+  assert.equal(exchanges.get(noKeyValue.code), 1);
+
+  // Database errors before the claim and after exchanging the code are service
+  // failures. Diagnostics must retain the phase without serializing exceptions.
+  for (const phase of ["browser_binding", "session_claim", "installation_storage"] as const) {
+    const failingDb = connect();
+    const failingApp = app(failingDb);
+    const session = await start(failingApp);
+    const before = await raw(session.id);
+    const value = fixture("TDATABASEFAILURE");
+    const injectedError = Object.assign(new Error(`${marker}: message`, { cause: new Error(`${marker}: cause`) }), {
+      name: `${marker}: name`, code: `${marker}: code`,
+    });
+    let transactionCalls = 0;
+    const originalTransaction = failingDb.transaction.bind(failingDb);
+    const failureMock = phase === "browser_binding"
+      ? mock.method(failingDb, "selectFrom", () => { throw injectedError; })
+      : mock.method(failingDb, "transaction", () => {
+        if (++transactionCalls === (phase === "session_claim" ? 1 : 2)) throw injectedError;
+        return originalTransaction();
+      });
+    try {
+      const offset = logs.length;
+      await failed(await callback(failingApp, session, value), session.id, 503);
+      failureLog(offset, phase, "storage_unavailable", 503);
+      const after = await raw(session.id);
+      assert.equal(after.bot_token_ciphertext, null);
+      if (phase === "installation_storage") {
+        assert.equal(after.status, "exchanging", "A staging outage cannot make the exchanged authorization code replayable");
+        assert.equal(exchanges.get(value.code), 1);
+      } else {
+        assert.deepEqual(after, before, "A failed pre-exchange database operation never claims the session");
+        assert.equal(exchanges.has(value.code), false);
+      }
+    } finally {
+      failureMock.mock.restore();
+      await failingApp.close();
+      await failingDb.destroy();
+    }
+  }
 
   const wrongKeyApp = app(db, Buffer.alloc(32, 38));
   const wrongKeySession = await start(wrongKeyApp);
   const previouslyPending = await raw(accepted[0].session.id);
-  await failed(await callback(wrongKeyApp, wrongKeySession, fixture("TWRONGKEY")), wrongKeySession.id);
+  const wrongKeyOffset = logs.length;
+  await failed(await callback(wrongKeyApp, wrongKeySession, fixture("TWRONGKEY")), wrongKeySession.id, 503);
+  failureLog(wrongKeyOffset, "installation_storage", "encryption_key_invalid", 503);
   assert.deepEqual(await raw(accepted[0].session.id), previouslyPending);
   assert.equal((await raw(wrongKeySession.id)).bot_token_ciphertext, null);
   // Carry these exact HTTP-created records through operator provisioning.

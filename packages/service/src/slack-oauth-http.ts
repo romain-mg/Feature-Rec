@@ -1,12 +1,13 @@
 import type { ServerResponse } from "node:http";
 import type { FastifyInstance } from "fastify";
-import type { Installation, InstallURLOptions } from "@slack/oauth";
+import { InvalidStateError, type Installation, type InstallURLOptions } from "@slack/oauth";
 import type { Kysely } from "kysely";
 import { z } from "zod";
 import type { ServiceEnv } from "./env";
 import { SlackClient } from "./slack";
 import { createSlackOAuthInstaller, SLACK_OAUTH_SCOPES } from "./slack-oauth";
 import type { DB } from "./storage/schema";
+import { SlackTokenKeyError } from "./storage/slack-token-check";
 import {
   claimSlackOAuthSession, cleanupSlackOAuthInstallations, createSlackOAuthSession,
   hasSlackOAuthBrowserBinding, stageSlackOAuthInstallation,
@@ -64,6 +65,42 @@ function complete(response: ServerResponse, status: number, message: string): vo
   response.end(message);
 }
 
+type CallbackPhase = "request_validation" | "browser_binding" | "session_claim" | "slack_exchange" |
+  "installation_validation" | "slack_identity" | "installation_storage";
+
+class InstallationValidationError extends Error {
+  constructor(readonly category: "unsupported_installation" | "identity_mismatch") { super(category); }
+}
+
+function callbackFailure(error: unknown, phase: CallbackPhase): { status: number; category: string } {
+  if (error instanceof InvalidStateError) return { status: 400, category: "invalid_state" };
+  if (error instanceof InstallationValidationError) return { status: 502, category: error.category };
+  if (error instanceof SlackTokenKeyError) return { status: 503, category: "encryption_key_invalid" };
+  if (["browser_binding", "session_claim", "installation_storage"].includes(phase)) {
+    return { status: 503, category: "storage_unavailable" };
+  }
+  // Only emit our fixed categories. Even an exception's name/code or a Slack
+  // error body can contain credentials; none is safe to log verbatim.
+  if (phase === "slack_exchange") {
+    const result = z.object({ code: z.string(), data: z.object({ error: z.string() }).optional() }).safeParse(error);
+    if (result.success) {
+      if (result.data.code === "slack_webapi_rate_limited_error") {
+        return { status: 503, category: "slack_rate_limited" };
+      }
+      if (result.data.code === "slack_webapi_platform_error") {
+        const reason = result.data.data?.error;
+        if (reason === "invalid_code" || reason === "code_already_used") return { status: 400, category: "invalid_code" };
+        if (reason === "ratelimited") return { status: 503, category: "slack_rate_limited" };
+        if (["internal_error", "fatal_error", "service_unavailable", "temporarily_unavailable"].includes(reason ?? "")) {
+          return { status: 503, category: "slack_unavailable" };
+        }
+        return { status: 502, category: "slack_rejected" };
+      }
+    }
+  }
+  return { status: 503, category: phase === "slack_exchange" || phase === "slack_identity" ? "slack_unavailable" : "internal_error" };
+}
+
 export function registerSlackOAuthRoutes(app: FastifyInstance, input: {
   db: Kysely<DB>;
   config: NonNullable<ServiceEnv["slackOAuth"]>;
@@ -119,12 +156,23 @@ export function registerSlackOAuthRoutes(app: FastifyInstance, input: {
   app.get("/api/slack/oauth/callback", { exposeHeadRoute: false }, async (request, reply) => {
     reply.hijack();
     const response = reply.raw;
-    prepareResponse(response);
+    // Admission has not claimed state or exchanged the code: keep the browser
+    // cookies so a rate-limited callback can retry while its session is valid.
+    prepareResponse(response, undefined, false);
+    let phase: CallbackPhase = "request_validation";
+    const fail = (error: unknown, res = response) => {
+      const diagnostic = callbackFailure(error, phase);
+      const details = { event: "SLACK_OAUTH_CALLBACK_FAILED", phase, ...diagnostic };
+      if (diagnostic.status >= 500) request.log.error(details, "Slack installation callback failed");
+      else request.log.warn(details, "Slack installation callback rejected");
+      complete(res, diagnostic.status, failure);
+    };
     try {
       if (!allowed(false)) {
         response.setHeader("Retry-After", "60"); complete(response, 429, "Too many installation callbacks. Try again shortly.\n"); return;
       }
       if (!input.encryptionKey) { complete(response, 503, "Slack installation is not configured.\n"); return; }
+      prepareResponse(response);
       const encryptionKey = input.encryptionKey;
       const params = new URL(request.raw.url ?? "", input.config.redirectUri).searchParams;
       const state = params.get("state");
@@ -132,9 +180,12 @@ export function registerSlackOAuthRoutes(app: FastifyInstance, input: {
       const stateCookie = cookieValue(request.headers.cookie, STATE_COOKIE);
       if (params.has("error") || params.getAll("code").length !== 1 || !params.get("code") ||
           params.get("code")!.length > 4096 || params.getAll("state").length !== 1 || !state || !secret.test(state) ||
-          !binding || !secret.test(binding) || stateCookie !== state ||
-          !await hasSlackOAuthBrowserBinding(input.db, { state, browserBinding: binding })) {
-        complete(response, 400, failure); return;
+          !binding || !secret.test(binding) || stateCookie !== state) {
+        throw new InvalidStateError("Invalid callback");
+      }
+      phase = "browser_binding";
+      if (!await hasSlackOAuthBrowserBinding(input.db, { state, browserBinding: binding })) {
+        throw new InvalidStateError("Session unavailable");
       }
       // Each request owns its installer, claim and verified identity. A shared
       // installer with mutable callback fields could cross-wire concurrent users.
@@ -145,16 +196,20 @@ export function registerSlackOAuthRoutes(app: FastifyInstance, input: {
         stateStore: {
           generateStateParam: async () => { throw new Error("Unexpected start on callback"); },
           verifyStateParam: async (_now, returnedState) => {
-            if (returnedState !== state) throw new Error("Invalid state");
+            if (returnedState !== state) throw new InvalidStateError("Invalid state");
+            phase = "session_claim";
             claim = await claimSlackOAuthSession(input.db, { state, browserBinding: binding });
-            if (!claim) throw new Error("Session unavailable");
+            if (!claim) throw new InvalidStateError("Session unavailable");
+            phase = "slack_exchange";
             return options;
           },
         },
         installationStore: {
           storeInstallation: async () => {
-            if (!claim || !verified || !await stageSlackOAuthInstallation(input.db, { ...claim, ...verified, encryptionKey })) {
-              throw new Error("Installation unavailable");
+            phase = "installation_storage";
+            if (!claim || !verified) throw new Error("Installation validation incomplete");
+            if (!await stageSlackOAuthInstallation(input.db, { ...claim, ...verified, encryptionKey })) {
+              throw new InvalidStateError("Installation unavailable");
             }
             stored = true;
           },
@@ -163,27 +218,29 @@ export function registerSlackOAuthRoutes(app: FastifyInstance, input: {
       });
       await installer.handleCallback(request.raw, response, {
         afterInstallation: async (installation: Installation) => {
+          phase = "installation_validation";
           const result = InstallationSchema.safeParse(installation);
           if (!result.success || result.data.appId !== input.config.appId ||
-              !SLACK_OAUTH_SCOPES.every((scope) => result.data.bot.scopes.includes(scope))) throw new Error("Unsupported installation");
+              !SLACK_OAUTH_SCOPES.every((scope) => result.data.bot.scopes.includes(scope))) {
+            throw new InstallationValidationError("unsupported_installation");
+          }
           const data = result.data;
+          phase = "slack_identity";
           const identity = await (input.slackClientFactory?.(data.bot.token) ?? new SlackClient(data.bot.token)).botIdentity();
-          if (identity.teamId !== data.team.id || identity.userId !== data.bot.userId) throw new Error("Slack identity mismatch");
+          if (identity.teamId !== data.team.id || identity.userId !== data.bot.userId) {
+            throw new InstallationValidationError("identity_mismatch");
+          }
           verified = { teamId: data.team.id, botUserId: data.bot.userId, token: data.bot.token };
           return true;
         },
         success: (_installation, _options, _request, res) => {
-          if (!stored || !claim || !verified) { complete(res, 400, failure); return; }
+          if (!stored || !claim || !verified) { fail(new Error("Installation validation incomplete"), res); return; }
           complete(res, 200, `Slack app installed. Feature-Rec activation is pending operator provisioning.\nInstallation ID: ${claim.id}\nWorkspace ID: ${verified.teamId}\n`);
         },
-        failure: (_error, _options, _request, res) => {
-          app.log.warn({ event: "SLACK_OAUTH_CALLBACK_FAILED" }, "Slack installation callback failed");
-          complete(res, 400, failure);
-        },
+        failure: (error, _options, _request, res) => { fail(error, res); },
       });
-    } catch {
-      app.log.warn({ event: "SLACK_OAUTH_CALLBACK_FAILED" }, "Slack installation callback failed");
-      complete(response, 400, failure);
+    } catch (error) {
+      fail(error);
     }
   });
 

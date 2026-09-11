@@ -3,8 +3,12 @@ import { sql, type Kysely, type Transaction } from "kysely";
 import { decryptSlackToken } from "../slack-token-crypto";
 import type { DB } from "./schema";
 
+// A typed boundary lets callers classify key configuration failures without
+// inspecting or exposing exception messages.
+export class SlackTokenKeyError extends Error {}
+
 function keyVerifier(key: Buffer): string {
-  if (key.byteLength !== 32) throw new Error("Slack token encryption key is invalid");
+  if (key.byteLength !== 32) throw new SlackTokenKeyError("Slack token encryption key is invalid");
   return crypto.createHmac("sha256", key).update("feature-rec:slack-token-key-check:v1").digest("base64");
 }
 
@@ -18,13 +22,13 @@ function matchesVerifier(key: Buffer, verifier: string): boolean {
 export async function ensureSlackTokenKey(trx: Transaction<DB>, key: Buffer): Promise<void> {
   const row = await trx.selectFrom("slack_token_encryption_key").select("verifier").where("id", "=", 1).executeTakeFirst();
   if (row) {
-    if (!matchesVerifier(key, row.verifier)) throw new Error("Slack token encryption key does not match the database verifier");
+    if (!matchesVerifier(key, row.verifier)) throw new SlackTokenKeyError("Slack token encryption key does not match the database verifier");
     return;
   }
   const workspace = await trx.selectFrom("slack_workspaces").select("team_id").limit(1).executeTakeFirst();
   const pending = await trx.selectFrom("slack_oauth_installations").select("id")
     .where("bot_token_ciphertext", "is not", null).limit(1).executeTakeFirst();
-  if (workspace || pending) throw new Error("Slack token key verifier is missing; restore it from backup before writing tokens");
+  if (workspace || pending) throw new SlackTokenKeyError("Slack token key verifier is missing; restore it from backup before writing tokens");
   await trx.insertInto("slack_token_encryption_key").values({ id: 1, verifier: keyVerifier(key) }).execute();
 }
 
