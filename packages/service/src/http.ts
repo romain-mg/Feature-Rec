@@ -1,4 +1,4 @@
-import Fastify, { type FastifyRequest } from "fastify";
+import Fastify, { type FastifyRequest, type FastifyServerOptions } from "fastify";
 import {
   buildCycleKey,
   ClassifierResultSchema,
@@ -26,6 +26,10 @@ import { withRetry } from "./retry";
 import { SlackClient, isRevokedSlackToken, respondEphemeral, verifySlackSignature } from "./slack";
 import type { SlackUsergroup } from "./slack";
 import { SlackWorkspaceUnavailableError, type CycleRecord, type CycleStore } from "./storage";
+
+import type { Kysely } from "kysely";
+import type { DB } from "./storage/schema";
+import { registerSlackOAuthRoutes } from "./slack-oauth-http";
 
 const VIDEO_BODY_LIMIT_BYTES = 500 * 1024 * 1024;
 
@@ -158,6 +162,8 @@ function headerAttemptId(header: unknown): string | undefined {
 export function buildServer(input: {
   env: ServiceEnv;
   store: CycleStore;
+  slackOAuthDb?: Kysely<DB>;
+  logger?: FastifyServerOptions["logger"];
   github?: GitHubClient;
   oidc?: RunnerIdentityVerifier;
   slackClientFactory?: (token: string) => SlackClient;
@@ -169,7 +175,23 @@ export function buildServer(input: {
   const oidc = input.oidc ?? new GitHubOidcVerifier(env);
   const slackResolver = new SlackResolver(store, env.slackTokenEncryptionKey, input.slackClientFactory);
   const ephemeral = input.respondEphemeral ?? respondEphemeral;
-  const app = Fastify({ logger: true });
+  const requestSerializer = (request: { method: string; url: string }) => ({
+    method: request.method, url: request.url.split("?")[0],
+  });
+  const app = Fastify({ logger: input.logger === false ? false : {
+    ...(typeof input.logger === "object" ? input.logger : {}),
+    serializers: {
+      ...(typeof input.logger === "object" ? input.logger.serializers : {}),
+      // Request logging happens before hooks; never log OAuth code/state queries.
+      req: requestSerializer,
+    },
+  } });
+  // Fastify's default 404 logs and echoes raw URLs independently of serializers.
+  app.setNotFoundHandler((_request, reply) => reply.code(404).send({ error: "not_found" }));
+  if (env.slackOAuth && input.slackOAuthDb) {
+    registerSlackOAuthRoutes(app, { db: input.slackOAuthDb, config: env.slackOAuth,
+      encryptionKey: env.slackTokenEncryptionKey, slackClientFactory: input.slackClientFactory });
+  }
 
   const runnerIdentities = new WeakMap<FastifyRequest, RunnerIdentity>();
   async function authenticateRunner(request: FastifyRequest): Promise<void> {

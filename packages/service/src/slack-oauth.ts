@@ -8,6 +8,8 @@ import {
 import type { FastifyBaseLogger } from "fastify";
 import type { ServiceEnv } from "./env";
 
+export const SLACK_OAUTH_SCOPES = ["chat:write", "files:write", "usergroups:read", "channels:read", "groups:read", "commands"];
+
 export function createSlackOAuthLogger(log: Pick<FastifyBaseLogger, "warn" | "error">): Logger {
   // SDK arguments can contain codes, URLs, credentials, and provider bodies. Drop
   // them entirely, including logger names; lowering verbosity alone is insufficient.
@@ -26,7 +28,6 @@ export function createSlackOAuthLogger(log: Pick<FastifyBaseLogger, "warn" | "er
   };
 }
 
-// The persistent stores and HTTP routes arrive in subsequent B2 milestones.
 // Require both adapters so this boundary cannot silently use SDK memory stores.
 export function createSlackOAuthInstaller(input: {
   config: NonNullable<ServiceEnv["slackOAuth"]>;
@@ -45,7 +46,7 @@ export function createSlackOAuthInstaller(input: {
     installationStore: input.installationStore,
     installUrlOptions: {
       redirectUri: input.config.redirectUri,
-      scopes: ["chat:write", "files:write", "usergroups:read", "channels:read", "groups:read", "commands"],
+      scopes: SLACK_OAUTH_SCOPES,
     },
     logger: createSlackOAuthLogger(input.logger),
     clientOptions: {
