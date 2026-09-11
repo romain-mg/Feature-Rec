@@ -11,7 +11,7 @@
     "dev": "tsx src/index.ts",
     "start": "node --enable-source-maps dist/index.js",
     "typecheck": "tsc --noEmit",
-    "selftest": "tsx scripts/oidc-selftest.mts && tsx scripts/slack-oauth-selftest.mts && tsx scripts/github-authorization-selftest.mts && tsx scripts/admin-input-selftest.mts && tsx scripts/selftest.mts && tsx scripts/storage-selftest.mts && tsx scripts/slack-oauth-storage-selftest.mts && tsx scripts/slack-oauth-http-selftest.mts && tsx scripts/http-multitenancy-selftest.mts && tsx scripts/slack-multitenancy-selftest.mts && tsx scripts/admin-selftest.mts"
+    "selftest": "tsx scripts/service-image-failure-selftest.mts && tsx scripts/oidc-selftest.mts && tsx scripts/slack-oauth-selftest.mts && tsx scripts/github-authorization-selftest.mts && tsx scripts/admin-input-selftest.mts && tsx scripts/selftest.mts && tsx scripts/storage-selftest.mts && tsx scripts/slack-oauth-storage-selftest.mts && tsx scripts/slack-oauth-http-selftest.mts && tsx scripts/http-multitenancy-selftest.mts && tsx scripts/slack-multitenancy-selftest.mts && tsx scripts/admin-selftest.mts"
   },
   "dependencies": {
     "@slack/oauth": "^4.0.0",

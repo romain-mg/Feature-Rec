@@ -20,15 +20,18 @@ dockerUrl.hostname = process.env.SERVICE_IMAGE_DATABASE_HOST ?? (process.platfor
 const network = process.platform === "linux" ? ["--network", "host"] : [];
 const port = String(30_000 + crypto.randomInt(20_000));
 const clientSecret = "fixture-image-client-secret";
+const encryptionKey = Buffer.alloc(32, 53).toString("base64");
 const baseUrl = "https://feature-rec-image.example";
 const commonEnv = [
   `DATABASE_URL=${dockerUrl}`, `PORT=${port}`, `FEATURE_REC_BASE_URL=${baseUrl}`,
-  `FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY=${Buffer.alloc(32, 53).toString("base64")}`,
+  `FEATURE_REC_SLACK_TOKEN_ENCRYPTION_KEY=${encryptionKey}`,
 ];
 const oauthEnv = ["SLACK_APP_ID=AIMAGE123", "SLACK_CLIENT_ID=123456.789012", `SLACK_CLIENT_SECRET=${clientSecret}`];
 const execute = promisify(execFile);
 const containers = new Set<string>();
-const secrets = new Set([clientSecret]);
+const secrets = new Set([
+  clientSecret, encryptionKey, dockerUrl.toString(), adminUrl.password, decodeURIComponent(adminUrl.password),
+].filter(Boolean));
 let sequence = 0;
 async function docker(args: string[]) {
   return execute("docker", args, { timeout: 60_000, maxBuffer: 1024 * 1024 });
@@ -163,6 +166,21 @@ try {
     sanitized(logs.stdout + logs.stderr);
   }
   console.log(`Service image selftest passed: configured/disabled health, redirect/cookies, partial configuration, compiled admin, cancellation and 0009/0008/0009${previousImage ? ", retained B image" : " (retained B image not supplied)"}.`);
+} catch (error) {
+  // Capture evidence before cleanup, without leaking fixtures or masking the test failure.
+  for (const name of containers) {
+    try {
+      const logs = await docker(["logs", name]);
+      let output = logs.stdout + logs.stderr;
+      for (const value of [...secrets].sort((left, right) => right.length - left.length)) {
+        output = output.replaceAll(value, "[REDACTED]");
+      }
+      console.error(`Service image failure logs (${name}):\n${output}`);
+    } catch {
+      console.error(`Service image failure logs unavailable (${name})`);
+    }
+  }
+  throw error;
 } finally {
   for (const name of containers) await docker(["rm", "--force", name]).catch(() => {});
   await db.end();

@@ -689,7 +689,9 @@ TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 Optionally set `PREVIOUS_SERVICE_IMAGE` to a locally retained B image to verify
 that it rejects schema 0009 and starts only after downgrade to 0008. The harness
 uses only the temporary database for migrations, fixtures and rollback, then
-removes its containers and database. It never loads `.env` or production credentials.
+removes its containers and database. On failure, it collects container stdout/stderr
+before removal, redacts known test credentials, and preserves the original test
+error if logs are unavailable. It never loads `.env` or production credentials.
 
 The following checks exercise real integrations in staging.
 
