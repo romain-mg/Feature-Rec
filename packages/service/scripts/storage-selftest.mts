@@ -38,7 +38,7 @@ function start(overrides: Partial<StartCycleInput> = {}): StartCycleInput {
 }
 
 try {
-  assert.equal(Object.keys(await migrationProvider.getMigrations()).sort().at(-1), "0008_multitenant_expand");
+  assert.equal(Object.keys(await migrationProvider.getMigrations()).sort().at(-1), "0009_slack_oauth_installations");
   await store.init();
   await db.insertInto("tenants").values([{ id: tenantA, enabled: true }, { id: tenantB, enabled: true }]).execute();
   await db.insertInto("github_installations").values([

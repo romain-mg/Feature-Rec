@@ -8,6 +8,8 @@ import * as dropLegacyBotChannels from "./0006_drop_legacy_bot_channels";
 import * as mentionModes from "./0007_mention_modes";
 import * as multitenantExpand from "./0008_multitenant_expand";
 
+import * as slackOAuthInstallations from "./0009_slack_oauth_installations";
+
 // Static import map (not FileMigrationProvider) so migrations resolve under
 // tsx and any future bundling without filesystem lookups.
 const migrations: Record<string, Migration> = {
@@ -19,6 +21,7 @@ const migrations: Record<string, Migration> = {
   "0006_drop_legacy_bot_channels": dropLegacyBotChannels,
   "0007_mention_modes": mentionModes,
   "0008_multitenant_expand": multitenantExpand,
+  "0009_slack_oauth_installations": slackOAuthInstallations,
 };
 
 export const migrationProvider: MigrationProvider = {

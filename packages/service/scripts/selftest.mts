@@ -726,6 +726,9 @@ try {
       );
       await constraintClient.end();
 
+      const downOAuth = await migrator.migrateTo("0008_multitenant_expand");
+      if (downOAuth.error) throw downOAuth.error;
+
       // 0008.down() refuses to make legacy names non-null when a newer row
       // cannot be represented by the compatibility runtime.
       await sql`

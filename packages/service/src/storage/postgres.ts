@@ -64,6 +64,8 @@ function rowToCycle(row: Selectable<ReviewCyclesTable>): CycleRecord {
 export class PostgresCycleStore implements CycleStore {
   #db: Kysely<DB>;
 
+  get database(): Kysely<DB> { return this.#db; }
+
   constructor(connectionString: string) {
     this.#db = new Kysely<DB>({
       dialect: new PostgresDialect({ pool: new Pool({ connectionString }) }),

@@ -1,4 +1,4 @@
-import type { ColumnType } from "kysely";
+import type { ColumnType, Generated } from "kysely";
 import type { ReviewCycleStatus } from "@feature-rec/core";
 
 export interface ReviewCyclesTable {
@@ -69,7 +69,25 @@ export interface GitHubInstallationsTable {
   github_account_id: string;
 }
 
+export interface SlackOAuthInstallationsTable {
+  id: string;
+  state_hash: string | null;
+  browser_binding_hash: string | null;
+  status: "awaiting_callback" | "exchanging" | "pending" | "consumed" | "expired" | "cancelled";
+  created_at: Generated<Date>;
+  expires_at: ColumnType<Date | null, Date | string | null, Date | string | null>;
+  claimed_at: ColumnType<Date | null, Date | string | null, Date | string | null>;
+  claim_id: string | null;
+  team_id: string | null;
+  bot_user_id: string | null;
+  bot_token_ciphertext: string | null;
+  consumed_at: ColumnType<Date | null, Date | string | null, Date | string | null>;
+  consumed_tenant_id: string | null;
+  consumed_github_installation_id: string | null;
+}
+
 export interface DB {
+  slack_oauth_installations: SlackOAuthInstallationsTable;
   review_cycles: ReviewCyclesTable;
   processed_interactions: ProcessedInteractionsTable;
   channel_settings: ChannelSettingsTable;
